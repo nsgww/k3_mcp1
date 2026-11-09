@@ -189,29 +189,40 @@ WAKE_ACK_ENABLED = os.getenv("WAKE_ACK_ENABLED", "1").strip().lower() not in {
 }
 _wake_ack: Optional[dict] = None  # {"bytes","sr","secs","text"}
 
+# 进工具前确认语：预合成后与 LLM 选型并行下发，避免挡在 Agent 前面
+PROCESS_ACK_TEXT = os.getenv("PROCESS_ACK_TEXT", "好的").strip()
+PROCESS_ACK_ENABLED = os.getenv("PROCESS_ACK_ENABLED", "1").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+}
+_process_ack: Optional[dict] = None  # {"bytes","sr","secs","text"}
 
-def _build_wake_ack() -> Optional[dict]:
-    """服务启动时预合成唤醒应答 wav 并缓存。"""
-    if not WAKE_ACK_ENABLED or not WAKE_ACK_TEXT or tts_model is None:
+
+def _presynth_tts_clip(text: str, *, log_tag: str) -> Optional[dict]:
+    """启动时预合成短句 wav 并缓存。"""
+    text = (text or "").strip()
+    if not text or tts_model is None:
         return None
     path = None
     try:
-        path = tts_model.ort_predict(WAKE_ACK_TEXT)
+        path = tts_model.ort_predict(text)
         if not path or not os.path.isfile(path):
-            print("[wake] 应答语预合成失败：输出为空")
+            print(f"[{log_tag}] 预合成失败：输出为空")
             return None
         wav_bytes = Path(path).read_bytes()
         sr = int(getattr(tts_model, "sample_rate", 16000) or 16000)
-        ack = {
+        clip = {
             "bytes": wav_bytes,
             "sr": sr,
             "secs": len(wav_bytes) / float(sr * 2),
-            "text": WAKE_ACK_TEXT,
+            "text": text,
         }
-        print(f"[wake] 应答语已预合成: {WAKE_ACK_TEXT!r} ~{ack['secs']:.1f}s")
-        return ack
+        print(f"[{log_tag}] 已预合成: {text!r} ~{clip['secs']:.1f}s")
+        return clip
     except Exception as e:
-        print(f"[wake] 应答语预合成失败: {e}")
+        print(f"[{log_tag}] 预合成失败: {e}")
         return None
     finally:
         if path:
@@ -221,45 +232,108 @@ def _build_wake_ack() -> Optional[dict]:
                 pass
 
 
+def _build_wake_ack() -> Optional[dict]:
+    """服务启动时预合成唤醒应答 wav 并缓存。"""
+    if not WAKE_ACK_ENABLED:
+        return None
+    return _presynth_tts_clip(WAKE_ACK_TEXT, log_tag="wake")
+
+
+def _build_process_ack() -> Optional[dict]:
+    """服务启动时预合成处理确认语（默认「好的」）。"""
+    if not PROCESS_ACK_ENABLED:
+        return None
+    return _presynth_tts_clip(PROCESS_ACK_TEXT, log_tag="process_ack")
+
+
+async def _send_cached_tts(
+    ws: ServerConnection,
+    clip: Optional[dict],
+    *,
+    mcast: Optional[MulticastPcmSource] = None,
+    gate: Optional["WakeGate"] = None,
+    wake_ack: bool = False,
+    log_tag: str = "tts",
+) -> float:
+    """下发已缓存的 wav（tts json + binary），可选组播/本地播放/延长 VAD 静默。"""
+    if clip is None:
+        return 0.0
+    payload = {
+        "type": "tts",
+        "format": "wav",
+        "sample_rate": clip["sr"],
+        "channels": 1,
+        "sample_width": 2,
+        "byte_length": len(clip["bytes"]),
+        "text": clip["text"],
+    }
+    if wake_ack:
+        payload["wake_ack"] = True
+    await _send_json(ws, payload)
+    await _send_bytes(ws, clip["bytes"])
+    if mcast is not None:
+        try:
+            await mcast.send_to(TTS_MULTICAST_GROUP, TTS_MULTICAST_PORT, clip["bytes"])
+        except Exception as e:
+            print(f"[{log_tag}] multicast send_to error: {e}")
+    if LOCAL_TTS_PLAYBACK:
+        import tempfile
+
+        local_path = tempfile.mktemp(suffix=".wav")
+        Path(local_path).write_bytes(clip["bytes"])
+        asyncio.create_task(_play_tts_local(local_path))
+    if gate is not None:
+        gate.mute_vad_for(clip["secs"])
+    return float(clip["secs"])
+
+
 async def _send_wake_ack(
     ws: ServerConnection,
     gate: Optional["WakeGate"],
     mcast: Optional[MulticastPcmSource] = None,
 ) -> None:
-    """唤醒命中 → 下发缓存的应答语（tts json + binary wav），并延长 VAD 静默期。
-
-    若开启 LOCAL_TTS_PLAYBACK，同时用板端音频设备播放应答语。
-    若当前为组播输入模式（mcast 非空），同步把应答语发到 TTS 输出组播地址。
-    """
-    if _wake_ack is None:
-        return
-    await _send_json(
-        ws,
-        {
-            "type": "tts",
-            "format": "wav",
-            "sample_rate": _wake_ack["sr"],
-            "channels": 1,
-            "sample_width": 2,
-            "byte_length": len(_wake_ack["bytes"]),
-            "text": _wake_ack["text"],
-            "wake_ack": True,
-        },
+    """唤醒命中 → 下发缓存的应答语（tts json + binary wav），并延长 VAD 静默期。"""
+    await _send_cached_tts(
+        ws, _wake_ack, mcast=mcast, gate=gate, wake_ack=True, log_tag="wake"
     )
-    await _send_bytes(ws, _wake_ack["bytes"])
-    if mcast is not None:
-        try:
-            await mcast.send_to(TTS_MULTICAST_GROUP, TTS_MULTICAST_PORT, _wake_ack["bytes"])
-        except Exception as e:
-            print(f"[wake] multicast send_to error: {e}")
-    if LOCAL_TTS_PLAYBACK:
-        import tempfile
 
-        local_path = tempfile.mktemp(suffix=".wav")
-        Path(local_path).write_bytes(_wake_ack["bytes"])
-        asyncio.create_task(_play_tts_local(local_path))
-    if gate is not None:
-        gate.mute_vad_for(_wake_ack["secs"])
+
+async def _send_process_ack(
+    ws: ServerConnection,
+    *,
+    tts_on: bool,
+    mcast: Optional[MulticastPcmSource] = None,
+    defer_mcast: bool = False,
+) -> float:
+    """
+    下发处理确认语；无缓存时回退现场合成。
+
+    defer_mcast=True：WS/本地播放先发完，组播实时候发放到后台任务，
+    便于与 LLM 选型并行（避免 await 组播挡 Agent）。
+    """
+    if not tts_on:
+        return 0.0
+    if _process_ack is not None:
+        if defer_mcast and mcast is not None:
+            secs = await _send_cached_tts(
+                ws, _process_ack, mcast=None, log_tag="process_ack"
+            )
+            clip = _process_ack
+
+            async def _mcast_bg() -> None:
+                try:
+                    await mcast.send_to(
+                        TTS_MULTICAST_GROUP, TTS_MULTICAST_PORT, clip["bytes"]
+                    )
+                except Exception as e:
+                    print(f"[process_ack] multicast send_to error: {e}")
+
+            asyncio.create_task(_mcast_bg())
+            return secs
+        return await _send_cached_tts(
+            ws, _process_ack, mcast=mcast, log_tag="process_ack"
+        )
+    return await _send_tts(ws, PROCESS_ACK_TEXT, tts_on=tts_on, mcast=mcast)
 
 
 def _wait_llm_ready(max_wait: float = 180.0, interval: float = 2.0) -> bool:
@@ -872,17 +946,33 @@ async def _process_utterance_inner(
         # MCP 在线：标准 Agent 循环（主 LLM + tools → tools/call → 回灌）
         if mcp_client.connected and mcp_client.tool_names:
             await _send_json(ws, {"type": "status", "message": "好的，正在处理..."})
-            await _send_tts(ws, "好的", tts_on=tts_on, mcast=mcast)
+            # 确认音：WS 快速下发；组播实时候发进后台，与选型并行
+            ack_secs = 0.0
+            if tts_on and PROCESS_ACK_ENABLED:
+                try:
+                    ack_secs = await _send_process_ack(
+                        ws, tts_on=tts_on, mcast=mcast, defer_mcast=True
+                    )
+                except Exception as e:
+                    print(f"[process_ack] error: {e}")
             await _send_json(ws, {"type": "status", "message": "正在思考..."})
+            t_agent = time.perf_counter()
             agent = await loop.run_in_executor(
                 executor, _run_tool_agent, text, loop
             )
+            agent_ms = (time.perf_counter() - t_agent) * 1000
+            # 体感：播完确认音之后还要等多久（组播播放与选型重叠）
+            after_ack_ms = max(0.0, agent_ms - ack_secs * 1000)
             calls = agent.get("calls") or []
             reply = (agent.get("content") or "").strip()
             template_reply = False
             print(
                 f"agent ({time.time() - t0:.3f}s): rounds={agent.get('rounds')} "
                 f"calls={[c.get('name') for c in calls]} reply={reply[:80]!r}"
+            )
+            print(
+                f"[latency] process_ack~{ack_secs:.2f}s agent={agent_ms:.0f}ms "
+                f"after_ack≈{after_ack_ms:.0f}ms"
             )
 
             if calls:
@@ -1861,11 +1951,12 @@ def _start_tts_http_server():
 
 
 async def main():
-    global _wake_ack
+    global _wake_ack, _process_ack
     await mcp_client.start()
     loop = asyncio.get_running_loop()
     if TTS_ENABLED_DEFAULT and tts_model is not None:
         _wake_ack = await loop.run_in_executor(executor, _build_wake_ack)
+        _process_ack = await loop.run_in_executor(executor, _build_process_ack)
     # 启动预热模型（MODEL_WARMUP=0 可关闭）
     if os.getenv("MODEL_WARMUP", "1").strip().lower() not in {"0", "false", "off", "no"}:
         await loop.run_in_executor(executor, _warmup_models)

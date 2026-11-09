@@ -26,7 +26,7 @@ Environment=LLM_BASE_URL=http://127.0.0.1:8080
 Environment=LLM_REQUEST_TIMEOUT=300
 Environment=MCP_TOOL_LLM=Qwen3-30B-A3B-Instruct-2507-Q4_0.gguf
 Environment=MCP_TOOL_STYLE=native
-Environment=MCP_TOOL_NUM_PREDICT=256
+Environment=MCP_TOOL_NUM_PREDICT=64
 Environment=MCP_REFRESH_INTERVAL=5
 ExecStart=/opt/envs/k3_mcp/bin/python /opt/k3_mcp1/09_asr_llm_ws.py
 Restart=on-failure
