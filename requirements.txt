@@ -1,0 +1,12 @@
+numpy>=2.2
+soundfile==0.13.1
+websockets>=15.0.1
+mcp==1.28.1                # 不要装 2.x,API 不兼容(代码按 1.x 写的)
+ollama>=0.4.7
+kaldi-native-fbank==1.20.1 # 源码编译,几分钟
+PyYAML>=6.0.1
+jieba==0.42.1              # ASR 文本处理和 MeloTTS 仍需要
+jsonschema>=4.0
+pypinyin>=0.54.0           # kws_keywords 接口自动生成拼音
+httpx>=0.28.1              # ASR 走 Qwen3-ASR HTTP 服务
+pydantic>=2.13

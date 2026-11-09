@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>组播语音助手测试</title>
+<style>
+  body { font-family: monospace; margin: 20px; background: #1e1e1e; color: #ddd; }
+  input, button { font-family: monospace; padding: 4px 8px; margin: 2px; }
+  #log { border: 1px solid #555; height: 60vh; overflow-y: auto; padding: 8px; margin-top: 10px; background: #111; }
+  .kws { color: #ff9800; font-weight: bold; }
+  .wake { color: #4caf50; }
+  .asr { color: #03a9f4; }
+  .llm { color: #e91e63; }
+  .err { color: #f44336; }
+  .sys { color: #888; }
+</style>
+</head>
+<body>
+<h3>k3_mcp1 组播语音助手最小测试页</h3>
+<div>
+  地址: <input id="url" value="ws://192.168.1.140:8060/stream/multicast" size="45">
+  <button onclick="connect()">连接</button>
+  <button onclick="disconnect()">断开</button>
+  <span id="state" class="sys">未连接</span>
+</div>
+<div>
+  切组: <input id="group" value="224.2.1.209" size="14"> : <input id="port" value="6020" size="6">
+  <button onclick="setGroup()">set_multicast_group</button>
+  <button onclick="sendJson({type:'ping'})">ping</button>
+  <button onclick="toggleGate()" id="gateBtn">关闭唤醒门控</button>
+</div>
+<div id="log"></div>
+
+<script>
+let ws = null, gateOn = true;
+const audioQueue = []; let playing = false;
+
+function log(text, cls) {
+  const d = document.createElement('div');
+  d.className = cls || 'sys';
+  d.textContent = new Date().toLocaleTimeString() + ' ' + text;
+  const el = document.getElementById('log');
+  el.appendChild(d); el.scrollTop = el.scrollHeight;
+}
+
+function connect() {
+  const url = document.getElementById('url').value;
+  ws = new WebSocket(url);
+  ws.binaryType = 'blob';
+  ws.onopen = () => { document.getElementById('state').textContent = '已连接'; log('连接 ' + url, 'wake'); };
+  ws.onclose = (e) => { document.getElementById('state').textContent = '已断开'; log('断开 code=' + e.code + ' ' + e.reason, 'err'); };
+  ws.onerror = () => log('连接错误', 'err');
+  ws.onmessage = (ev) => {
+    if (typeof ev.data !== 'string') { playAudio(ev.data); return; }  // 二进制 = TTS wav
+    let m; try { m = JSON.parse(ev.data); } catch { log(ev.data); return; }
+    if (m.type === 'kws') log('【唤醒命中】' + m.message, 'kws');
+    else if (m.type === 'wake_state') log('门控状态 → ' + m.state, 'wake');
+    else if (m.type === 'asr') log('【识别】' + m.text, 'asr');
+    else if (m.type === 'llm') log('【回复】' + (m.text || m.message), 'llm');
+    else if (m.type === 'error') log('【错误】' + m.message, 'err');
+    else log(JSON.stringify(m));
+  };
+}
+
+function disconnect() { if (ws) ws.close(); }
+function sendJson(o) { if (ws && ws.readyState === 1) { ws.send(JSON.stringify(o)); log('>> ' + JSON.stringify(o)); } }
+function setGroup() {
+  sendJson({ type: 'set_multicast_group',
+             group: document.getElementById('group').value,
+             port: parseInt(document.getElementById('port').value) });
+}
+function toggleGate() {
+  gateOn = !gateOn;
+  sendJson({ type: 'wake_gate', enabled: gateOn });
+  document.getElementById('gateBtn').textContent = gateOn ? '关闭唤醒门控' : '开启唤醒门控';
+}
+
+function playAudio(blob) {
+  audioQueue.push(blob);
+  if (!playing) nextAudio();
+}
+function nextAudio() {
+  const b = audioQueue.shift();
+  if (!b) { playing = false; return; }
+  playing = true;
+  const a = new Audio(URL.createObjectURL(b));
+  a.onended = nextAudio; a.onerror = nextAudio;
+  a.play().catch(nextAudio);
+  log('♪ 播放 TTS 音频 (' + b.size + 'B)');
+}
+</script>
+</body>
+</html>

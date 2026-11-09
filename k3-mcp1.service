@@ -1,0 +1,39 @@
+[Unit]
+Description=K3 MCP1 (legacy snapshot) ASR LLM WebSocket
+After=network-online.target qwen3asr-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bianbu
+Group=bianbu
+WorkingDirectory=/opt/k3_mcp1
+Environment=PYTHONPATH=/opt/k3_mcp1
+Environment=PYTHONUNBUFFERED=1
+Environment=KWS_MODEL_DIR=/var/lib/models/hf/scenarios/kws/current
+Environment=TTS_MODEL_DIR=/var/lib/sm-sdk/models/tts/matcha-icefall-zh-en
+Environment=TTS_BACKEND=matcha
+Environment=MCP_CONFIG=/opt/k3_mcp1/mcp.json
+Environment=AUTO_LOCAL_MIC=0
+Environment=AUTO_MULTICAST=1
+Environment=AUTO_MULTICAST_GROUP=224.2.1.213
+Environment=AUTO_MULTICAST_PORT=6020
+Environment=TTS_MULTICAST_GROUP=224.2.1.179
+Environment=TTS_MULTICAST_PORT=6020
+Environment=LOCAL_TTS_PLAYBACK=0
+Environment=LLM_BACKEND=llama-server
+Environment=LLM_BASE_URL=http://127.0.0.1:8080
+Environment=LLM_REQUEST_TIMEOUT=300
+Environment=MCP_TOOL_LLM=Qwen3-30B-A3B-Instruct-2507-Q4_0.gguf
+Environment=MCP_TOOL_STYLE=native
+Environment=MCP_TOOL_NUM_PREDICT=256
+Environment=MCP_REFRESH_INTERVAL=5
+ExecStart=/opt/envs/k3_mcp/bin/python /opt/k3_mcp1/09_asr_llm_ws.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=k3_mcp1
+
+[Install]
+WantedBy=multi-user.target

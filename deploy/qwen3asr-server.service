@@ -1,0 +1,27 @@
+[Unit]
+Description=Qwen3-ASR HTTP Server (llama-server SMT media backend, 0.6B)
+After=network.target
+
+[Service]
+Type=simple
+User=root123
+Group=root123
+ExecStart=/usr/bin/llama-server \
+  -m /var/lib/sm-sdk/models/asr/qwen3asr/Qwen3-ASR-0.6B-text-q40.gguf \
+  --host 127.0.0.1 \
+  --port 8091 \
+  -t 4 \
+  -tb 4 \
+  -c 4096 \
+  --media-backend smt \
+  --smt-config-dir /var/lib/sm-sdk/models/asr/qwen3asr \
+  --warmup
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=300
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=qwen3asr-server
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,1916 @@
+import asyncio
+import http.server
+import io
+import json
+import os
+import socket
+import subprocess
+import threading
+import time
+import wave
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Optional
+from urllib.parse import parse_qs, urlparse
+
+import httpx
+import numpy as np
+import websockets
+from speex_resample import resample
+from websockets.asyncio.server import ServerConnection, serve
+
+# ---------------------------------------------------------------------------
+# 加载顺序（板端实测）：
+#   1) KWS / TTS：先 import sherpa_onnx，绑定其自带 ORT（VERS_1.24.2）
+#   2) ASR：再加载系统 onnxruntime 1.24.0+spacemit
+# 若先 ASR 再 sherpa → sherpa 会去链系统 ORT，报 VERS_1.24.2 not found
+# ---------------------------------------------------------------------------
+# 闲聊/LLM 口播：一句话目标字数
+LLM_MAX_CHARS = int(os.getenv("LLM_MAX_CHARS", "15"))
+# 单发模式：一次 MCP 控制后回待机，需再次唤醒才能继续（1=开启，0=连续对话窗口）
+ONE_SHOT_MODE = os.getenv("ONE_SHOT_MODE", "1").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+}
+# 多设备工具结果模板口播上限（按条数放大，避免只播第一条）
+TOOL_REPLY_MAX_CHARS = int(os.getenv("TOOL_REPLY_MAX_CHARS", "80"))
+TTS_ENABLED_DEFAULT = os.getenv("TTS_ENABLED", "1").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+}
+# 默认 Matcha 中英混合；可 TTS_BACKEND=vits 切回 aishell3
+os.environ.setdefault("TTS_BACKEND", "matcha")
+os.environ.setdefault(
+    "TTS_MODEL_DIR",
+    "/var/lib/sm-sdk/models/tts/matcha-icefall-zh-en",
+)
+
+from kws_spotter import (
+    apply_keywords,
+    build_kws_engine_from_env,
+    format_kws_message,
+    load_keyword_phrases,
+    match_wake_keyword,
+    strip_wake_prefix,
+)
+from wake_gate import WakeGate
+from multicast_source import MCAST_GROUP, MCAST_PORT, MulticastPcmSource
+from local_mic_source import LocalMicSource
+
+kws_engine = build_kws_engine_from_env()
+KWS_PHRASES = load_keyword_phrases()
+
+
+def _reload_kws() -> None:
+    """热重载 KWS 引擎与唤醒词表（已有连接的旧 session 不受影响）。"""
+    global kws_engine, KWS_PHRASES
+    kws_engine = build_kws_engine_from_env()
+    KWS_PHRASES = load_keyword_phrases()
+
+# Matcha/VITS TTS：紧接 KWS，共用 sherpa_onnx
+from sherpa_tts import build_sherpa_tts_from_env
+
+tts_model = build_sherpa_tts_from_env() if TTS_ENABLED_DEFAULT else None
+
+from mcp_sse_client import build_mcp_pool_from_env
+from spacemit_llm import LLMModel
+from spacemit_llm.llm_model import finalize_reply
+from spacemit_asr import ASRModel
+
+HOST = "0.0.0.0"
+PORT = 8060
+TTS_HTTP_HOST = os.getenv("TTS_HTTP_HOST", "0.0.0.0")
+TTS_HTTP_PORT = int(os.getenv("TTS_HTTP_PORT", "8061"))
+WS_PATH = "/stream"
+# 组播输入路径（风格同 multi-stream-asr 的 /ws/stream vs /ws/multicast）：
+# /stream            客户端 PCM 上行（本机麦克风）
+# /stream/multicast  组播音频输入，可用 ?group=&port= 指定地址
+WS_PATH_MULTICAST = "/stream/multicast"
+WS_PATH_LOCAL_MIC = "/stream/local_mic"
+DEFAULT_SAMPLE_RATE = 16000
+ASR_SAMPLE_RATE = 16000
+MIN_AUDIO_SECONDS = 0.5  # 短于该时长的语音直接丢弃，不进 ASR
+
+# 服务启动即自动开启本地麦克风（无需任何 WebSocket 客户端连接）
+AUTO_LOCAL_MIC = os.getenv("AUTO_LOCAL_MIC", "1").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+}
+_auto_local_mic_device_raw = os.getenv("AUTO_LOCAL_MIC_DEVICE", "0").strip()
+AUTO_LOCAL_MIC_RATE = int(os.getenv("AUTO_LOCAL_MIC_RATE", "16000"))
+AUTO_LOCAL_MIC_CHUNK = int(os.getenv("AUTO_LOCAL_MIC_CHUNK", "512"))
+if _auto_local_mic_device_raw.lower() == "auto":
+    from local_mic_source import find_first_input_device
+
+    AUTO_LOCAL_MIC_DEVICE = find_first_input_device(
+        rate=AUTO_LOCAL_MIC_RATE, chunk=AUTO_LOCAL_MIC_CHUNK
+    )
+else:
+    AUTO_LOCAL_MIC_DEVICE = int(_auto_local_mic_device_raw)
+
+# 服务启动即自动连接组播输入（无需任何 WebSocket 客户端连接）
+AUTO_MULTICAST = os.getenv("AUTO_MULTICAST", "1").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+}
+AUTO_MULTICAST_GROUP = os.getenv("AUTO_MULTICAST_GROUP", MCAST_GROUP).strip()
+AUTO_MULTICAST_PORT = int(os.getenv("AUTO_MULTICAST_PORT", str(MCAST_PORT)))
+
+# 板端本地播放 TTS（不依赖前端浏览器）
+LOCAL_TTS_PLAYBACK = os.getenv("LOCAL_TTS_PLAYBACK", "1").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+}
+LOCAL_TTS_PLAYER = os.getenv("LOCAL_TTS_PLAYER", "pw-play").strip() or "pw-play"
+
+# 组播输入模式下，TTS 输出固定发往该组播地址（不再原路返回输入组）
+TTS_MULTICAST_GROUP = os.getenv("TTS_MULTICAST_GROUP", "224.2.1.179").strip()
+TTS_MULTICAST_PORT = int(os.getenv("TTS_MULTICAST_PORT", "6020"))
+
+
+# MCP Server 配置：优先 mcp.json（MCP_CONFIG 可改路径），否则 MCP_SSE_URL
+# 多工具顺序调用时，每次 tools/call 之间的间隔（秒）
+# 多工具改为并行调用后默认不再串行等待；需要限流时可设回 0.1
+MCP_MULTI_CALL_INTERVAL = float(os.getenv("MCP_MULTI_CALL_INTERVAL", "0"))
+MCP_REQUEST_TIMEOUT = float(os.getenv("MCP_REQUEST_TIMEOUT", "15"))
+
+llm_model = LLMModel()
+asr_model = ASRModel()
+mcp_client = build_mcp_pool_from_env()
+
+executor = ThreadPoolExecutor(max_workers=3)
+infer_lock = asyncio.Lock()
+
+# 自动本地麦克风模式：显示客户端订阅列表与广播队列
+_auto_local_mic_listeners: set[ServerConnection] = set()
+_auto_local_mic_queue: asyncio.Queue[dict | bytes] = asyncio.Queue()
+
+# 同一 group:port 只留一个组播处理会话，其余连接只订阅事件
+_mcast_owners: dict[tuple[str, int], ServerConnection] = {}
+_mcast_owner_lock = asyncio.Lock()
+_mcast_display_listeners: set[ServerConnection] = set()
+
+
+# 进程级复用 SileroVAD（避免每次 wake_gate 新建 ORT Session 撑爆板端内存）
+_vad_shared = None
+
+
+def _get_shared_vad():
+    global _vad_shared
+    if _vad_shared is None:
+        from spacemit_audio.record_vad import SileroVAD
+
+        _vad_shared = SileroVAD()
+        print("[gate] SileroVAD ready (shared)")
+    return _vad_shared
+
+
+class ClientGone(Exception):
+    """对端已断开，停止本轮下行发送。"""
+
+
+# 唤醒应答语：启动时预合成缓存，命中即毫秒级下发（现场合成要数秒，体验差）
+WAKE_ACK_TEXT = os.getenv("WAKE_ACK_TEXT", "我在").strip()
+WAKE_ACK_ENABLED = os.getenv("WAKE_ACK_ENABLED", "1").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+}
+_wake_ack: Optional[dict] = None  # {"bytes","sr","secs","text"}
+
+
+def _build_wake_ack() -> Optional[dict]:
+    """服务启动时预合成唤醒应答 wav 并缓存。"""
+    if not WAKE_ACK_ENABLED or not WAKE_ACK_TEXT or tts_model is None:
+        return None
+    path = None
+    try:
+        path = tts_model.ort_predict(WAKE_ACK_TEXT)
+        if not path or not os.path.isfile(path):
+            print("[wake] 应答语预合成失败：输出为空")
+            return None
+        wav_bytes = Path(path).read_bytes()
+        sr = int(getattr(tts_model, "sample_rate", 16000) or 16000)
+        ack = {
+            "bytes": wav_bytes,
+            "sr": sr,
+            "secs": len(wav_bytes) / float(sr * 2),
+            "text": WAKE_ACK_TEXT,
+        }
+        print(f"[wake] 应答语已预合成: {WAKE_ACK_TEXT!r} ~{ack['secs']:.1f}s")
+        return ack
+    except Exception as e:
+        print(f"[wake] 应答语预合成失败: {e}")
+        return None
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+async def _send_wake_ack(
+    ws: ServerConnection,
+    gate: Optional["WakeGate"],
+    mcast: Optional[MulticastPcmSource] = None,
+) -> None:
+    """唤醒命中 → 下发缓存的应答语（tts json + binary wav），并延长 VAD 静默期。
+
+    若开启 LOCAL_TTS_PLAYBACK，同时用板端音频设备播放应答语。
+    若当前为组播输入模式（mcast 非空），同步把应答语发到 TTS 输出组播地址。
+    """
+    if _wake_ack is None:
+        return
+    await _send_json(
+        ws,
+        {
+            "type": "tts",
+            "format": "wav",
+            "sample_rate": _wake_ack["sr"],
+            "channels": 1,
+            "sample_width": 2,
+            "byte_length": len(_wake_ack["bytes"]),
+            "text": _wake_ack["text"],
+            "wake_ack": True,
+        },
+    )
+    await _send_bytes(ws, _wake_ack["bytes"])
+    if mcast is not None:
+        try:
+            await mcast.send_to(TTS_MULTICAST_GROUP, TTS_MULTICAST_PORT, _wake_ack["bytes"])
+        except Exception as e:
+            print(f"[wake] multicast send_to error: {e}")
+    if LOCAL_TTS_PLAYBACK:
+        import tempfile
+
+        local_path = tempfile.mktemp(suffix=".wav")
+        Path(local_path).write_bytes(_wake_ack["bytes"])
+        asyncio.create_task(_play_tts_local(local_path))
+    if gate is not None:
+        gate.mute_vad_for(_wake_ack["secs"])
+
+
+def _wait_llm_ready(max_wait: float = 180.0, interval: float = 2.0) -> bool:
+    """轮询 llama-server /health，等模型加载完成。"""
+    base = (llm_model._base_url or "http://127.0.0.1:8080").rstrip("/")
+    health_url = f"{base}/health"
+    deadline = time.perf_counter() + max_wait
+    while time.perf_counter() < deadline:
+        try:
+            r = httpx.get(health_url, timeout=5)
+            if r.status_code == 200 and r.json().get("status") == "ok":
+                return True
+        except Exception:
+            pass
+        time.sleep(interval)
+    return False
+
+
+def _warmup_models() -> None:
+    """
+    启动预热：消除各模型首次调用的加载/初始化开销。
+    KWS/TTS 加载与应答语预合成已在启动路径完成；MCP 由 start() 握手。
+    单项失败不阻断启动。
+    """
+    # 1) VAD：首次推理建 ORT Session
+    try:
+        t0 = time.perf_counter()
+        vad = _get_shared_vad()
+        vad(b"\x00" * 1024)
+        vad.reset()
+        print(f"[warmup] VAD ok ({time.perf_counter() - t0:.1f}s)")
+    except Exception as e:
+        print(f"[warmup] VAD 失败（不影响唤醒，首连时再试）: {e}")
+
+    # 2) ASR：0.5s 静音跑一次，预热 ORT 图/线程池
+    try:
+        t0 = time.perf_counter()
+        _run_asr(np.zeros(8000, dtype=np.int16))
+        print(f"[warmup] ASR ok ({time.perf_counter() - t0:.1f}s)")
+    except Exception as e:
+        print(f"[warmup] ASR 失败: {e}")
+
+    # 3) LLM：等 llama-server 模型加载完，再把 tool prompt 预热进 cache
+    t0 = time.perf_counter()
+    if _wait_llm_ready():
+        print(f"[warmup] LLM ready ({time.perf_counter() - t0:.1f}s)")
+        # 避免连续请求触发 llama-server slot 复用 bug，先歇一下
+        time.sleep(2)
+        try:
+            tools = mcp_client.list_cached_tools()
+            llm_model.warmup_tool_prompt(tools)
+        except Exception as e:
+            print(f"[warmup] tool prompt warmup 失败: {e}")
+    else:
+        print("[warmup] LLM 未就绪，跳过 tool 预热（后续请求自动加载）")
+
+
+def _to_pcm16(audio_np: np.ndarray, sample_rate: int) -> np.ndarray:
+    """转为 ASR 所需的 16kHz int16 PCM。"""
+    if audio_np.dtype != np.int16:
+        audio_np = audio_np.astype(np.int16)
+    if sample_rate == ASR_SAMPLE_RATE:
+        return audio_np
+    waveform = resample(audio_np, sample_rate, ASR_SAMPLE_RATE)
+    if waveform.size == 0:
+        return np.array([], dtype=np.int16)
+    return np.clip(waveform, -32768, 32767).astype(np.int16)
+
+
+def _run_asr(audio_np: np.ndarray) -> Optional[str]:
+    return asr_model.generate(audio_np, sr=ASR_SAMPLE_RATE)
+
+
+def _iter_llm(text: str):
+    for chunk in llm_model.generate(text):
+        yield chunk
+
+
+def _run_tool_agent(text: str, loop: asyncio.AbstractEventLoop) -> dict:
+    """
+    标准 Agent 循环（在线程池中跑）：主 LLM + tools → MCP tools/call → 回灌。
+    execute_tool 通过 run_coroutine_threadsafe 调异步 MCP Client。
+    """
+    tools = mcp_client.list_cached_tools()
+    call_count = [0]
+
+    def execute_tool(name: str, args: dict) -> str:
+        if call_count[0] > 0 and MCP_MULTI_CALL_INTERVAL > 0:
+            time.sleep(MCP_MULTI_CALL_INTERVAL)
+        call_count[0] += 1
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                mcp_client.call_tool(name, args or {}),
+                loop,
+            )
+            result = fut.result(timeout=MCP_REQUEST_TIMEOUT + 5)
+        except Exception as e:
+            print(f"[MCP] {name} 调用异常: {type(e).__name__}: {e}")
+            return "ERROR: 调用失败"
+        if not result.ok:
+            err = (result.error or "tools/call failed").strip()
+            print(f"[MCP] {name} 调用失败: {err}")
+            return "ERROR: 调用失败"
+        return result.text or "ok"
+
+    return llm_model.run_tool_agent(text, tools, execute_tool)
+
+
+def _mcp_config_path() -> str:
+    return os.getenv(
+        "MCP_CONFIG", str(Path(__file__).resolve().parent / "mcp.json")
+    )
+
+
+def _read_mcp_servers() -> dict:
+    """读 mcp.json 的 mcpServers（原样返回，含 disabled 条目）。"""
+    try:
+        data = json.loads(Path(_mcp_config_path()).read_text(encoding="utf-8-sig"))
+        servers = data.get("mcpServers")
+        return servers if isinstance(servers, dict) else {}
+    except Exception:
+        return {}
+
+
+def _mcp_servers_info() -> list[dict]:
+    """当前各服务器状态（配置 + 运行时连接/工具数）。"""
+    infos = []
+    clients = getattr(mcp_client, "_clients", {})
+    for name, cfg in _read_mcp_servers().items():
+        c = clients.get(name)
+        infos.append(
+            {
+                "name": name,
+                "url": str(cfg.get("url") or "") if isinstance(cfg, dict) else "",
+                "disabled": bool(cfg.get("disabled")) if isinstance(cfg, dict) else False,
+                "connected": bool(c and c.connected),
+                "tools": len(c.list_cached_tools()) if c and c.connected else 0,
+            }
+        )
+    return infos
+
+
+async def _reload_mcp_pool() -> None:
+    """按当前 mcp.json 热切换 MCP 连接池。"""
+    global mcp_client
+    old = mcp_client
+    try:
+        await old.stop()
+    except Exception:
+        pass
+    mcp_client = build_mcp_pool_from_env()
+    await mcp_client.start()
+    await mcp_client.wait_ready(timeout=10)
+    # tool schema 变了，旧 prompt cache 失效，重新预热
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            executor, llm_model.warmup_tool_prompt, mcp_client.list_cached_tools()
+        )
+    except Exception as e:
+        print(f"[mcp] tool prompt re-warmup failed: {e}")
+
+
+async def _apply_mcp_change(action: str, name: str, url: str = "") -> None:
+    """修改 mcp.json（set=新增/改地址，remove=删除）并热切换，重启后保留。"""
+    cfg_path = _mcp_config_path()
+    try:
+        data = json.loads(Path(cfg_path).read_text(encoding="utf-8-sig"))
+    except Exception:
+        data = {"mcpServers": {}}
+    servers = data.setdefault("mcpServers", {})
+    if action == "set":
+        if name in servers and isinstance(servers[name], dict):
+            servers[name]["url"] = url
+            servers[name]["type"] = servers[name].get("type") or "sse"
+            servers[name]["disabled"] = False
+        else:
+            servers[name] = {"type": "sse", "url": url, "disabled": False}
+    elif action == "remove":
+        if name not in servers:
+            raise ValueError(f"服务器不存在: {name}")
+        del servers[name]
+    else:
+        raise ValueError(f"未知 action: {action}")
+    Path(cfg_path).write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    await _reload_mcp_pool()
+
+
+def _run_tts_file(text: str) -> Optional[str]:
+    if not text or tts_model is None:
+        return None
+    return tts_model.ort_predict(text)
+
+
+def _mcast_key(group: str, port: int) -> tuple[str, int]:
+    return (str(group), int(port))
+
+
+def _is_mcast_owner(ws: ServerConnection) -> bool:
+    return any(owner is ws for owner in _mcast_owners.values())
+
+
+def _release_mcast_owner(ws: ServerConnection) -> None:
+    for key, owner in list(_mcast_owners.items()):
+        if owner is ws:
+            _mcast_owners.pop(key, None)
+
+
+async def _fanout_mcast_display(ws: ServerConnection, data: str | bytes) -> None:
+    """处理会话发出的事件抄送给只订阅的组播连接。"""
+    if not _is_mcast_owner(ws) or not _mcast_display_listeners:
+        return
+    dead: list[ServerConnection] = []
+    for other in list(_mcast_display_listeners):
+        if other is ws:
+            continue
+        try:
+            await other.send(data)
+        except Exception:
+            dead.append(other)
+    for other in dead:
+        _mcast_display_listeners.discard(other)
+
+
+async def _retarget_mcast_owner(
+    ws: ServerConnection,
+    old_group: str,
+    old_port: int,
+    new_group: str,
+    new_port: int,
+) -> bool:
+    old_key = _mcast_key(old_group, old_port)
+    new_key = _mcast_key(new_group, new_port)
+    if old_key == new_key:
+        return True
+    async with _mcast_owner_lock:
+        other = _mcast_owners.get(new_key)
+        if other is not None and other is not ws:
+            return False
+        if _mcast_owners.get(old_key) is ws:
+            _mcast_owners.pop(old_key, None)
+        _mcast_owners[new_key] = ws
+    return True
+
+
+async def _send_json(ws: ServerConnection, payload: dict):
+    data = json.dumps(payload, ensure_ascii=False)
+    try:
+        await ws.send(data)
+    except websockets.exceptions.ConnectionClosed as e:
+        raise ClientGone from e
+    await _fanout_mcast_display(ws, data)
+
+
+async def _send_bytes(ws: ServerConnection, data: bytes):
+    try:
+        await ws.send(data)
+    except websockets.exceptions.ConnectionClosed as e:
+        raise ClientGone from e
+    await _fanout_mcast_display(ws, data)
+
+
+async def _broadcast_json(payload: dict):
+    """向所有本地麦克风显示客户端广播 JSON 消息。"""
+    data = json.dumps(payload, ensure_ascii=False)
+    dead = set()
+    for ws in _auto_local_mic_listeners:
+        try:
+            await ws.send(data)
+        except Exception:
+            dead.add(ws)
+    for ws in dead:
+        _auto_local_mic_listeners.discard(ws)
+
+
+async def _broadcast_bytes(data: bytes):
+    """向所有本地麦克风显示客户端广播二进制音频。"""
+    dead = set()
+    for ws in _auto_local_mic_listeners:
+        try:
+            await ws.send(data)
+        except Exception:
+            dead.add(ws)
+    for ws in dead:
+        _auto_local_mic_listeners.discard(ws)
+
+
+async def _broadcast_loop():
+    """后台广播循环：把自动本地麦会话的消息分发给显示客户端。"""
+    while True:
+        item = await _auto_local_mic_queue.get()
+        if item is None:
+            break
+        if isinstance(item, bytes):
+            await _broadcast_bytes(item)
+        else:
+            await _broadcast_json(item)
+
+
+async def _play_tts_local(wav_path: str) -> None:
+    """在板端本地播放 TTS wav 文件，播放结束后删除。"""
+    try:
+        print(f"[TTS] local playback: {wav_path}")
+        proc = await asyncio.create_subprocess_exec(
+            LOCAL_TTS_PLAYER, wav_path,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        await proc.wait()
+    except Exception as e:
+        print(f"[TTS] local playback error: {e}")
+    finally:
+        try:
+            os.unlink(wav_path)
+        except OSError:
+            pass
+
+
+async def _send_tts(
+    ws: ServerConnection,
+    text: str,
+    *,
+    tts_on: bool,
+    mcast: Optional[MulticastPcmSource] = None,
+) -> float:
+    """
+    合成并下发: tts(json) → binary wav。
+    若当前为组播输入（mcast 非空），同步把 TTS wav 固定发往 TTS_MULTICAST_GROUP:TTS_MULTICAST_PORT。
+    若开启 LOCAL_TTS_PLAYBACK，同时用板端音频设备播放。
+    临时文件发送后删除。失败不阻断主流程。
+    返回播报时长（秒，近似；wake_gate 用它算回采静默期），未播报/失败返回 0.0。
+    """
+    text = (text or "").strip()
+    if not tts_on or not text or tts_model is None:
+        return 0.0
+    loop = asyncio.get_running_loop()
+    path = None
+    try:
+        # 板端 TTS 很慢，先通知客户端别按总超时掐断
+        await _send_json(
+            ws,
+            {"type": "status", "message": f"tts synthesizing ({len(text)} chars)"},
+        )
+        path = await loop.run_in_executor(executor, _run_tts_file, text)
+        if not path or not os.path.isfile(path):
+            await _send_json(ws, {"type": "error", "message": "tts failed: empty output"})
+            return 0.0
+        wav_bytes = Path(path).read_bytes()
+        sr = int(getattr(tts_model, "sample_rate", 16000) or 16000)
+        await _send_json(
+            ws,
+            {
+                "type": "tts",
+                "format": "wav",
+                "sample_rate": sr,
+                "channels": 1,
+                "sample_width": 2,
+                "byte_length": len(wav_bytes),
+                "text": text,
+            },
+        )
+        await _send_bytes(ws, wav_bytes)
+        print(f"[TTS] sent {len(wav_bytes)} bytes sr={sr} text={text[:40]!r}")
+        if mcast is not None:
+            try:
+                await mcast.send_to(TTS_MULTICAST_GROUP, TTS_MULTICAST_PORT, wav_bytes)
+            except Exception as e:
+                print(f"[TTS] multicast send_to error: {e}")
+        if LOCAL_TTS_PLAYBACK:
+            # 本地播放：复制文件后启动后台播放任务
+            import tempfile
+            local_path = tempfile.mktemp(suffix=".wav")
+            Path(local_path).write_bytes(wav_bytes)
+            asyncio.create_task(_play_tts_local(local_path))
+        return len(wav_bytes) / float(sr * 2)  # int16 mono 近似时长
+    except ClientGone:
+        raise
+    except Exception as e:
+        print(f"[TTS] error: {e}")
+        await _send_json(ws, {"type": "error", "message": f"tts failed: {e}"})
+        return 0.0
+    finally:
+        if path and not LOCAL_TTS_PLAYBACK:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+# 工具返回的通用确认词：播报时翻译成工具描述（如"已打开办公室灯"）
+_GENERIC_ACK = {
+    "ok",
+    "okay",
+    "success",
+    "succeeded",
+    "done",
+    "true",
+    "1",
+    "成功",
+    "好的",
+    "已执行",
+    "已完成",
+}
+
+
+def _device_label(desc: str, name: str) -> str:
+    """从 MCP description 得到口播名，不写死设备；去掉尾部「状态」等冗余。"""
+    label = (desc or name or "").strip()
+    for suffix in ("的状态", "当前状态", "状态"):
+        if label.endswith(suffix) and len(label) > len(suffix):
+            label = label[: -len(suffix)].strip()
+            break
+    return label or name
+
+
+# 动作类 description 的前缀动词：命中则口播「已+动作短语」（如「已关闭办公室灯」），
+# 否则回退「已执行：…」（如「灯光亮度」这类非动作描述）
+_ACTION_VERBS = ("打开", "关闭", "切换", "调", "设置", "升", "降")
+
+
+def _ack_phrase(label: str) -> str:
+    """工具只回通用确认（ok/done）时，用 description 拼自然口播。"""
+    if label and label.startswith(_ACTION_VERBS):
+        return f"已{label}"
+    return f"已执行：{label}" if label else "已执行"
+
+
+def _result_value(text: str) -> Optional[str]:
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    if isinstance(data, dict) and "value" in data:
+        return str(data["value"])
+    return None
+
+
+def _summarize_tool_results(results: list[dict]) -> str:
+    """
+    汇总 tools/call 结果用于 TTS。
+    设备名一律来自 MCP tools/list 的 description，不维护设备白名单。
+    """
+    desc_map = {
+        t.name: (t.description or t.name) for t in mcp_client.list_cached_tools()
+    }
+    parts: list[str] = []
+    status_pairs: list[tuple[str, str]] = []
+
+    for r in results:
+        name = r.get("name") or ""
+        desc = desc_map.get(name, name)
+        label = _device_label(desc, name)
+        text = (r.get("result") or "").strip()
+        low = text.lower().strip("。.!！ ")
+        if not r.get("ok"):
+            err = (r.get("error") or "").strip()
+            if err.startswith("ERROR:"):
+                err = err[len("ERROR:"):].strip()
+            parts.append(err or "执行失败")
+            continue
+        if not text or low in _GENERIC_ACK:
+            # description 本身常是「打开/关闭办公室灯」，口播「已关闭办公室灯」
+            parts.append(_ack_phrase(label))
+            continue
+        val = _result_value(text)
+        if val is not None:
+            status_pairs.append((label, val))
+            parts.append(f"{label}：{val}")
+        else:
+            parts.append(text)
+
+    # 多路查询：同值合并为自然说法；否则「办公室灯：关、走廊灯：开」
+    if len(results) > 1 and len(status_pairs) == len(results):
+        vals = [v for _, v in status_pairs]
+        if len(set(vals)) == 1:
+            v = vals[0]
+            if v in ("开", "开启", "打开"):
+                return "都是开的"
+            if v in ("关", "关闭"):
+                return "都是关的"
+            return f"均为{v}"
+        return "、".join(f"{lab}：{val}" for lab, val in status_pairs)
+
+    if len(parts) > 1 and all(p.startswith("已") for p in parts):
+        # 多个控制结果：动作前缀相同则合并设备名，
+        # 「已关闭办公室灯/走廊灯/会议室灯」→「已关闭办公室灯、走廊灯、会议室灯」
+        bodies = [p[1:] for p in parts]
+        prefix = bodies[0]
+        for b in bodies[1:]:
+            while prefix and not b.startswith(prefix):
+                prefix = prefix[:-1]
+        if len(prefix) >= 2 and prefix.startswith(_ACTION_VERBS):
+            return "已" + prefix + "、".join(b[len(prefix):] for b in bodies)
+        return "、".join(parts)
+    return "、".join(parts) if len(parts) > 1 else (parts[0] if parts else "")
+
+
+async def _process_utterance(
+    ws: ServerConnection,
+    audio_buf: bytearray,
+    sample_rate: int,
+    kws_hits: Optional[list] = None,
+    *,
+    tts_on: bool = True,
+    mcast: Optional[MulticastPcmSource] = None,
+) -> float:
+    """整段音频 → ASR → LLM/Agent → TTS；返回本轮 TTS 播报总时长（秒）。"""
+    try:
+        return await _process_utterance_inner(
+            ws, audio_buf, sample_rate, kws_hits, tts_on=tts_on, mcast=mcast
+        )
+    except ClientGone:
+        print("[ws] client gone during process，已释放推理锁")
+        return 0.0
+    except asyncio.CancelledError:
+        print("[ws] process cancelled，已释放推理锁")
+        raise
+
+
+async def _process_utterance_inner(
+    ws: ServerConnection,
+    audio_buf: bytearray,
+    sample_rate: int,
+    kws_hits: Optional[list] = None,
+    *,
+    tts_on: bool = True,
+    mcast: Optional[MulticastPcmSource] = None,
+) -> float:
+    if not audio_buf:
+        await _send_json(ws, {"type": "error", "message": "empty audio"})
+        await _send_json(ws, {"type": "done"})
+        return 0.0
+
+    audio_np = np.frombuffer(bytes(audio_buf), dtype=np.int16).copy()
+    audio_np = _to_pcm16(audio_np, sample_rate)
+    if audio_np.size == 0:
+        await _send_json(ws, {"type": "error", "message": "invalid audio"})
+        await _send_json(ws, {"type": "done"})
+        return 0.0
+
+    duration = len(audio_np) / ASR_SAMPLE_RATE
+    if duration < MIN_AUDIO_SECONDS:
+        print(f"[asr] 语音过短({duration:.2f}s < {MIN_AUDIO_SECONDS}s)，丢弃不识别")
+        await _send_json(
+            ws,
+            {
+                "type": "status",
+                "status": "too_short",
+                "message": f"语音过短({duration:.2f}s < {MIN_AUDIO_SECONDS}s)，已忽略",
+            },
+        )
+        await _send_json(ws, {"type": "done"})
+        return 0.0
+    await _send_json(
+        ws,
+        {"type": "status", "message": f"processing audio ({duration:.2f}s)"},
+    )
+
+    loop = asyncio.get_running_loop()
+    async with infer_lock:
+        t0 = time.time()
+        text = await loop.run_in_executor(executor, _run_asr, audio_np)
+        if not text:
+            await _send_json(ws, {"type": "error", "message": "asr failed or empty"})
+            await _send_json(ws, {"type": "done"})
+            return 0.0
+
+        print("user:", text)
+        await _send_json(ws, {"type": "asr", "text": text})
+        await _send_json(ws, {"type": "status", "message": "收到，正在理解..."})
+
+        # 本轮只说了唤醒词：报 KWS + TTS，不进 LLM
+        wake = match_wake_keyword(text, kws_hits or [], KWS_PHRASES)
+        if wake:
+            tip = format_kws_message(wake)
+            print(tip, "(wake-only, skip LLM)")
+            await _send_json(
+                ws,
+                {"type": "kws", "keyword": wake, "message": tip, "wake_only": True},
+            )
+            secs = await _send_tts(ws, tip, tts_on=tts_on, mcast=mcast)
+            await _send_json(ws, {"type": "done"})
+            return secs
+
+        # 端侧唤醒（方案 B）连说场景：预缓冲可能带入唤醒词，
+        # ASR 以唤醒词开头（如「你好军哥打开客厅灯」）→ 剥掉词头再进 LLM
+        prefix_hit = strip_wake_prefix(text, KWS_PHRASES)
+        if prefix_hit is not None:
+            kw, rest = prefix_hit
+            if rest:
+                print(f"[wake] 剥离唤醒词头 {kw}: {text!r} → {rest!r}")
+                text = rest
+            else:
+                # 词头后无有效内容，按 wake-only 处理（match_wake_keyword 的兜底）
+                tip = format_kws_message(kw)
+                print(tip, "(wake-only prefix, skip LLM)")
+                await _send_json(
+                    ws,
+                    {"type": "kws", "keyword": kw, "message": tip, "wake_only": True},
+                )
+                secs = await _send_tts(ws, tip, tts_on=tts_on, mcast=mcast)
+                await _send_json(ws, {"type": "done"})
+                return secs
+
+        # MCP 在线：标准 Agent 循环（主 LLM + tools → tools/call → 回灌）
+        if mcp_client.connected and mcp_client.tool_names:
+            await _send_json(ws, {"type": "status", "message": "好的，正在处理..."})
+            await _send_tts(ws, "好的", tts_on=tts_on, mcast=mcast)
+            await _send_json(ws, {"type": "status", "message": "正在思考..."})
+            agent = await loop.run_in_executor(
+                executor, _run_tool_agent, text, loop
+            )
+            calls = agent.get("calls") or []
+            reply = (agent.get("content") or "").strip()
+            template_reply = False
+            print(
+                f"agent ({time.time() - t0:.3f}s): rounds={agent.get('rounds')} "
+                f"calls={[c.get('name') for c in calls]} reply={reply[:80]!r}"
+            )
+
+            if calls:
+                await _send_json(ws, {"type": "status", "message": "正在执行..."})
+                all_ok = all(c.get("ok") for c in calls)
+                names = [c["name"] for c in calls]
+                await _send_json(
+                    ws,
+                    {
+                        "type": "function",
+                        "called": True,
+                        "ok": all_ok,
+                        "source": "mcp",
+                        "route": "agent",
+                        "name": names[0] if len(names) == 1 else "、".join(names),
+                        "arguments": calls[0].get("arguments") or {},
+                        "result": calls[0].get("result"),
+                        "error": calls[0].get("error"),
+                        "calls": [
+                            {
+                                "name": c["name"],
+                                "arguments": c.get("arguments") or {},
+                                "ok": c.get("ok", False),
+                                "result": c.get("result"),
+                                "error": c.get("error"),
+                            }
+                            for c in calls
+                        ],
+                    },
+                )
+                if not reply:
+                    reply = _summarize_tool_results(
+                        [
+                            {
+                                "name": c["name"],
+                                "ok": c.get("ok"),
+                                "result": c.get("result"),
+                                "error": c.get("error"),
+                            }
+                            for c in calls
+                        ]
+                    )
+                    template_reply = True
+
+            if reply:
+                if template_reply:
+                    # 工具结果：按路数放宽，不套闲聊 15 字（否则多设备只剩第一条）
+                    budget = (
+                        TOOL_REPLY_MAX_CHARS
+                        if len(calls) > 1
+                        else LLM_MAX_CHARS
+                    )
+                    reply = finalize_reply(reply, budget)
+                else:
+                    reply = finalize_reply(reply, LLM_MAX_CHARS)
+            secs = 0.0
+            if reply:
+                print(reply)
+                await _send_json(ws, {"type": "llm", "text": reply, "done": False})
+                await _send_json(ws, {"type": "llm", "text": "", "done": True})
+                # secs = await _send_tts(ws, reply, tts_on=tts_on, mcast=mcast)
+            await _send_json(ws, {"type": "done"})
+            return secs
+
+        # MCP 离线：纯流式闲聊
+        await _send_json(ws, {"type": "status", "message": "llm generating"})
+        queue: asyncio.Queue = asyncio.Queue()
+
+        def _produce():
+            try:
+                for chunk in _iter_llm(text):
+                    loop.call_soon_threadsafe(queue.put_nowait, chunk)
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+            except Exception as e:
+                loop.call_soon_threadsafe(queue.put_nowait, e)
+
+        producer = loop.run_in_executor(executor, _produce)
+        out_chars = 0
+        full_parts: list[str] = []
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                await _send_json(ws, {"type": "error", "message": f"llm error: {item}"})
+                await producer
+                await _send_json(ws, {"type": "done"})
+                return 0.0
+            print(item, end="", flush=True)
+            full_parts.append(item or "")
+            await _send_json(ws, {"type": "llm", "text": item, "done": False})
+            out_chars += len(item or "")
+            # 多留一点供句末收尾，最终 TTS 再用 finalize_reply
+            if LLM_MAX_CHARS > 0 and out_chars >= max(LLM_MAX_CHARS * 3, 48):
+                print(f"\n[LLM] stop decode at {out_chars} chars")
+                break
+
+        print()
+        await _send_json(ws, {"type": "llm", "text": "", "done": True})
+        await producer
+
+        full_text = finalize_reply("".join(full_parts), LLM_MAX_CHARS)
+        secs = 0.0
+        if full_text:
+            secs = await _send_tts(ws, full_text, tts_on=tts_on, mcast=mcast)
+        await _send_json(ws, {"type": "done"})
+        return secs
+
+
+async def _process_gate_utterance(
+    ws: ServerConnection,
+    gate: WakeGate,
+    audio: bytes,
+    *,
+    tts_on: bool,
+    drain_client: bool = True,
+    mcast: Optional[MulticastPcmSource] = None,
+) -> float:
+    """
+    门控模式下跑一轮指令：处理期间持续排空上行 PCM，
+    避免收包缓冲堆积；对端断开则取消本轮并立刻释放推理锁，保证可重连。
+
+    drain_client=False（组播模式）：客户端无音频上行可排空，且 handler 主循环
+    正占着 recv——此处再 recv 会抛 ConcurrencyError，直接等任务结束即可。
+    """
+    task = asyncio.create_task(
+        _process_utterance(
+            ws,
+            bytearray(audio),
+            DEFAULT_SAMPLE_RATE,
+            kws_hits=[],
+            tts_on=tts_on,
+            mcast=mcast,
+        )
+    )
+    if not drain_client:
+        return await task
+    try:
+        while not task.done():
+            recv_task = asyncio.create_task(ws.recv())
+            done, _pending = await asyncio.wait(
+                {task, recv_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if recv_task in done:
+                try:
+                    msg = recv_task.result()
+                except websockets.exceptions.ConnectionClosed:
+                    task.cancel()
+                    try:
+                        await task
+                    except (asyncio.CancelledError, ClientGone):
+                        pass
+                    raise
+                if isinstance(msg, bytes):
+                    # PROCESSING 态丢弃；避免数十秒音频堆积后一次性灌入 FOLLOWUP
+                    gate.feed(msg)
+                else:
+                    try:
+                        data = json.loads(msg)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    if data.get("type") == "ping":
+                        try:
+                            await _send_json(ws, {"type": "pong"})
+                        except ClientGone:
+                            task.cancel()
+                            try:
+                                await task
+                            except (asyncio.CancelledError, ClientGone):
+                                pass
+                            raise ClientGone("pong failed")
+            else:
+                recv_task.cancel()
+                try:
+                    await recv_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        return task.result()
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
+
+
+async def handler(websocket: ServerConnection):
+    raw_path = websocket.request.path if websocket.request else ""
+    parsed = urlparse(raw_path)
+    path = parsed.path
+    query = parse_qs(parsed.query)
+    multicast_mode = path == WS_PATH_MULTICAST
+    local_mic_mode = path == WS_PATH_LOCAL_MIC
+    auto_local_mic_client = local_mic_mode and query.get("auto", ["0"])[0] == "1"
+    display_mode = local_mic_mode and AUTO_LOCAL_MIC and not auto_local_mic_client
+    if path not in (WS_PATH, WS_PATH_MULTICAST, WS_PATH_LOCAL_MIC):
+        await websocket.close(
+            1008, f"path must be {WS_PATH}, {WS_PATH_MULTICAST} or {WS_PATH_LOCAL_MIC}"
+        )
+        return
+
+    sample_rate = DEFAULT_SAMPLE_RATE
+    tts_on = TTS_ENABLED_DEFAULT and tts_model is not None
+    audio_buf = bytearray()
+    kws_hits_turn: list = []
+    # 显示模式：只订阅自动本地麦会话的事件，不创建自己的门控与麦克风
+    if display_mode:
+        _auto_local_mic_listeners.add(websocket)
+        print(f"[auto_mic] display client connected: {websocket.id}")
+        await _send_json(
+            websocket,
+            {
+                "type": "status",
+                "message": "connected to auto local mic (display mode)",
+                "mcp_connected": mcp_client.connected,
+                "mcp_tools": sorted(mcp_client.tool_names),
+                "kws_enabled": kws_engine is not None,
+                "tts_enabled": tts_on,
+                "wake_gate": True,
+                "source": f"auto_local_mic display",
+            },
+        )
+        try:
+            async for message in websocket:
+                if isinstance(message, bytes):
+                    continue
+                try:
+                    data = json.loads(message)
+                except json.JSONDecodeError:
+                    continue
+                if data.get("type") == "ping":
+                    await _send_json(websocket, {"type": "pong"})
+        except Exception as e:
+            print(f"[auto_mic] display client error: {e}")
+        finally:
+            _auto_local_mic_listeners.discard(websocket)
+            print(f"[auto_mic] display client disconnected: {websocket.id}")
+        return
+
+    # 组播：自动组播地址只允许带 auto=1 的内部客户端处理。
+    # 其他地址同一 group:port 只留一路；后来的连接只订阅，不再入组。
+    claimed_owner = False
+    mcast_display = False
+    mcast_group = ""
+    mcast_port = 0
+    if multicast_mode:
+        mcast_group = query.get("group", [MCAST_GROUP])[0]
+        mcast_port = int(query.get("port", [str(MCAST_PORT)])[0])
+        auto_mcast_client = query.get("auto", ["0"])[0] == "1"
+        key = _mcast_key(mcast_group, mcast_port)
+        reserved = AUTO_MULTICAST and key == _mcast_key(
+            AUTO_MULTICAST_GROUP, AUTO_MULTICAST_PORT
+        )
+        prev_owner: Optional[ServerConnection] = None
+        async with _mcast_owner_lock:
+            if not auto_mcast_client and (reserved or key in _mcast_owners):
+                mcast_display = True
+            else:
+                prev_owner = _mcast_owners.get(key)
+                if prev_owner is websocket:
+                    prev_owner = None
+                _mcast_owners[key] = websocket
+                claimed_owner = True
+        if prev_owner is not None:
+            print(f"[mcast] 关闭旧处理会话 {mcast_group}:{mcast_port}")
+            try:
+                await prev_owner.close(4000, "replaced by multicast owner")
+            except Exception:
+                pass
+    if mcast_display:
+        _mcast_display_listeners.add(websocket)
+        print(
+            f"[mcast] display client connected: {websocket.id} "
+            f"group={mcast_group}:{mcast_port}"
+        )
+        await _send_json(
+            websocket,
+            {
+                "type": "status",
+                "message": "multicast display only（不入组、不执行指令）",
+                "mcp_connected": mcp_client.connected,
+                "mcp_tools": sorted(mcp_client.tool_names),
+                "kws_enabled": kws_engine is not None,
+                "tts_enabled": tts_on,
+                "wake_gate": True,
+                "source": f"multicast display {mcast_group}:{mcast_port}",
+            },
+        )
+        try:
+            async for message in websocket:
+                if isinstance(message, bytes):
+                    continue
+                try:
+                    data = json.loads(message)
+                except json.JSONDecodeError:
+                    continue
+                msg_type = data.get("type")
+                if msg_type == "ping":
+                    await _send_json(websocket, {"type": "pong"})
+                elif msg_type in ("set_multicast_group", "wake_gate"):
+                    await _send_json(
+                        websocket,
+                        {
+                            "type": "error",
+                            "message": "当前是订阅连接，不能切组或改唤醒门",
+                        },
+                    )
+        except Exception as e:
+            print(f"[mcast] display client error: {e}")
+        finally:
+            _mcast_display_listeners.discard(websocket)
+            print(f"[mcast] display client disconnected: {websocket.id}")
+        return
+
+    kws_session = kws_engine.create_session() if kws_engine else None
+    # 唤醒门控默认开启：KWS 和 VAD 就绪时直接创建，客户端仍可发 wake_gate 关闭
+    gate: Optional[WakeGate] = None
+    if kws_session is not None:
+        try:
+            vad = _get_shared_vad()
+            vad.reset()
+            gate = WakeGate(kws_session, vad, format_kws_message, one_shot=ONE_SHOT_MODE)
+            print("[gate] default enabled (client can send wake_gate to disable)")
+        except Exception as e:
+            print(f"[gate] default init failed: {e}")
+    # 组播输入模式：连接即加入组播组，CMD_B 心跳触发硬件音源开播
+    mcast: Optional[MulticastPcmSource] = None
+    mcast_task: "Optional[asyncio.Task]" = None
+    if multicast_mode:
+        mcast = MulticastPcmSource(group=mcast_group, port=mcast_port)
+        try:
+            await mcast.start()
+        except Exception as e:
+            if claimed_owner:
+                _release_mcast_owner(websocket)
+                claimed_owner = False
+            await _send_json(
+                websocket, {"type": "error", "message": f"组播加入失败: {e}"}
+            )
+            await websocket.close(1011, "multicast join failed")
+            return
+
+    # 本地麦克风输入模式：服务端直接从板载麦克风采音
+    local_mic: Optional[LocalMicSource] = None
+    local_mic_task: "Optional[asyncio.Task]" = None
+    if local_mic_mode:
+        local_mic = LocalMicSource(
+            device_index=int(query.get("device", [os.getenv("LOCAL_MIC_DEVICE_INDEX", "0")])[0]),
+            rate=int(query.get("rate", [os.getenv("LOCAL_MIC_RATE", "16000")])[0]),
+            chunk_samples=int(
+                query.get("chunk", [os.getenv("LOCAL_MIC_CHUNK_SAMPLES", "512")])[0]
+            ),
+        )
+        try:
+            await local_mic.start()
+        except Exception as e:
+            await _send_json(
+                websocket, {"type": "error", "message": f"本地麦克风打开失败: {e}"}
+            )
+            await websocket.close(1011, "local mic failed")
+            return
+
+    mcp_tools = sorted(mcp_client.tool_names)
+    await _send_json(
+        websocket,
+        {
+            "type": "status",
+            "message": (
+                f"connected, send PCM int16 mono @{sample_rate}Hz, "
+                'then {"type":"end"} to process'
+            ),
+            "mcp_connected": mcp_client.connected,
+            "mcp_tools": mcp_tools,
+            "kws_enabled": kws_session is not None,
+            "tts_enabled": tts_on,
+            "wake_gate": gate is not None,
+            "source": (
+                f"multicast {mcast.group}:{mcast.port}"
+                if mcast is not None
+                else (
+                    f"local_mic device={local_mic.device_index} rate={local_mic.rate}"
+                    if local_mic is not None
+                    else "ws"
+                )
+            ),
+        },
+    )
+
+    async def handle_uplink(chunk: bytes) -> None:
+        """上行 PCM 统一入口：WS 二进制帧与组播帧走完全相同的门控/缓冲逻辑。"""
+        if gate is not None:
+            # 唤醒门控：帧进状态机，命中+说完才输出整段指令音频
+            audio = gate.feed(chunk)
+            for ev in gate.drain_events():
+                await _send_json(websocket, ev)
+                if (
+                    ev.get("type") == "wake_state"
+                    and ev.get("state") == "woken"
+                    and tts_on
+                ):
+                    # 唤醒应答「我在」：缓存 wav 毫秒级下发
+                    await _send_wake_ack(websocket, gate, mcast)
+            if audio is not None:
+                try:
+                    secs = await _process_gate_utterance(
+                        websocket, gate, audio, tts_on=tts_on,
+                        drain_client=not (multicast_mode or local_mic_mode),
+                        mcast=mcast,
+                    )
+                except (websockets.exceptions.ConnectionClosed, ClientGone):
+                    raise
+                gate.on_reply_done(secs)
+                for ev in gate.drain_events():
+                    await _send_json(websocket, ev)
+                if mcast is not None:
+                    # 丢弃处理期间积压的陈旧组播帧，直接从最新音频继续
+                    mcast.flush()
+            return
+        # ASR 缓冲与 KWS 并行：同一段 PCM 两边都吃
+        audio_buf.extend(chunk)
+        if kws_session is not None:
+            try:
+                hits = kws_session.accept_pcm16(chunk, sample_rate)
+            except Exception as e:
+                print(f"[KWS] decode error: {e}")
+                hits = []
+            for kw in hits:
+                kws_hits_turn.append(kw)
+                tip = format_kws_message(kw)
+                print(tip)
+                # 录音中只推 JSON，避免 TTS 阻塞收 PCM；wake-only 在 end 后播报
+                await _send_json(
+                    websocket,
+                    {
+                        "type": "kws",
+                        "keyword": kw,
+                        "message": tip,
+                    },
+                )
+
+    async def _forward_mcast() -> None:
+        """组播帧 → 门控/处理流程（处理期间队列满自动丢帧）。"""
+        assert mcast is not None
+        try:
+            while True:
+                frame = await mcast.next_frame()
+                if frame is None:
+                    break
+                await handle_uplink(frame)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # 转发死亡 = 组播静默失效，必须留痕
+            print(f"[mcast] 转发协程异常退出: {type(e).__name__}: {e}", flush=True)
+            raise
+
+    async def _forward_local_mic() -> None:
+        """本地麦克风帧 → 门控/处理流程。"""
+        assert local_mic is not None
+        print(
+            f"[local_mic] 开始转发: device={local_mic.device_index} "
+            f"rate={local_mic.rate} chunk={local_mic.chunk_samples}",
+            flush=True,
+        )
+        try:
+            async for frame in local_mic.frames():
+                await handle_uplink(frame)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[local_mic] 转发协程异常退出: {type(e).__name__}: {e}", flush=True)
+            raise
+
+    if mcast is not None:
+        mcast_task = asyncio.create_task(_forward_mcast())
+
+    if local_mic is not None:
+        local_mic_task = asyncio.create_task(_forward_local_mic())
+
+    try:
+        async for message in websocket:
+            if isinstance(message, bytes):
+                # 组播/本地麦模式下音频来自服务端采集，忽略客户端上行 PCM
+                if not multicast_mode and not local_mic_mode:
+                    await handle_uplink(message)
+                continue
+
+            try:
+                data = json.loads(message)
+            except json.JSONDecodeError:
+                await _send_json(websocket, {"type": "error", "message": "invalid json"})
+                continue
+
+            msg_type = data.get("type")
+            if msg_type == "ping":
+                await _send_json(websocket, {"type": "pong"})
+            elif msg_type == "set_multicast_group":
+                # 运行时切换组播地址（仅 /stream/multicast；同 multi-stream-asr）
+                if mcast is None:
+                    await _send_json(
+                        websocket,
+                        {"type": "error", "message": "仅 /stream/multicast 支持切组"},
+                    )
+                    continue
+                new_group = str(data.get("group") or mcast.group).strip()
+                new_port = int(data.get("port") or mcast.port)
+                old_group, old_port = mcast.group, mcast.port
+                if not await _retarget_mcast_owner(
+                    websocket, old_group, old_port, new_group, new_port
+                ):
+                    await _send_json(
+                        websocket,
+                        {"type": "error", "message": "该组播地址已有处理会话"},
+                    )
+                    continue
+                try:
+                    await mcast.set_group(new_group, new_port)
+                except Exception as e:
+                    await _retarget_mcast_owner(
+                        websocket, new_group, new_port, old_group, old_port
+                    )
+                    await _send_json(
+                        websocket, {"type": "error", "message": f"切组失败: {e}"}
+                    )
+                    continue
+                await _send_json(
+                    websocket,
+                    {
+                        "type": "status",
+                        "message": f"multicast group={new_group}:{new_port}",
+                        "source": f"multicast {new_group}:{new_port}",
+                    },
+                )
+            elif msg_type == "mcp_status":
+                await _send_json(
+                    websocket,
+                    {
+                        "type": "mcp_status",
+                        "connected": mcp_client.connected,
+                        "tools": [
+                            {
+                                "name": t.name,
+                                "description": t.description,
+                                "inputSchema": t.input_schema,
+                            }
+                            for t in mcp_client.list_cached_tools()
+                        ],
+                    },
+                )
+            elif msg_type == "mcp_refresh":
+                if not mcp_client.connected:
+                    await _send_json(
+                        websocket,
+                        {"type": "error", "message": "MCP Server 未连接"},
+                    )
+                    continue
+                tools = await mcp_client.refresh_tools()
+                await _send_json(
+                    websocket,
+                    {
+                        "type": "mcp_status",
+                        "connected": True,
+                        "tools": [
+                            {
+                                "name": t.name,
+                                "description": t.description,
+                                "inputSchema": t.input_schema,
+                            }
+                            for t in tools
+                        ],
+                    },
+                )
+            elif msg_type == "kws_keywords":
+                content = data.get("content")
+                raw_content = data.get("raw_content")
+                if content is None and raw_content is None:
+                    # 查询当前词表
+                    await _send_json(
+                        websocket,
+                        {
+                            "type": "kws_keywords",
+                            "phrases": KWS_PHRASES,
+                            "kws_enabled": kws_engine is not None,
+                        },
+                    )
+                    continue
+                try:
+                    n = apply_keywords(content=content, raw_content=raw_content)
+                    await asyncio.get_running_loop().run_in_executor(executor, _reload_kws)
+                except ValueError as e:
+                    await _send_json(websocket, {"type": "error", "message": str(e)})
+                    continue
+                except Exception as e:
+                    await _send_json(
+                        websocket,
+                        {"type": "error", "message": f"词表应用失败: {e}"},
+                    )
+                    continue
+                await _send_json(
+                    websocket,
+                    {
+                        "type": "kws_keywords",
+                        "phrases": KWS_PHRASES,
+                        "kws_enabled": kws_engine is not None,
+                        "message": f"词表已更新并重载: {n} 个词",
+                    },
+                )
+            elif msg_type == "mcp_config":
+                action = str(data.get("action") or "").strip().lower()
+                name = str(data.get("name") or "").strip()
+                new_url = str(data.get("url") or "").strip()
+                # 兼容旧用法：只给 url 不给 name/action → 改第一个服务器
+                if not action and new_url and not name:
+                    servers = _read_mcp_servers()
+                    name = next(iter(servers), "PGMControl SSE")
+                    action = "set"
+                if not action:
+                    # 查询：列出全部服务器
+                    await _send_json(
+                        websocket,
+                        {
+                            "type": "mcp_config",
+                            "servers": _mcp_servers_info(),
+                            "connected": mcp_client.connected,
+                            "tools": sorted(mcp_client.tool_names),
+                        },
+                    )
+                    continue
+                if not name:
+                    await _send_json(
+                        websocket,
+                        {"type": "error", "message": "缺少 name（服务器名）"},
+                    )
+                    continue
+                if action == "set" and not new_url.startswith(("http://", "https://")):
+                    await _send_json(
+                        websocket,
+                        {"type": "error", "message": "url 需以 http:// 或 https:// 开头"},
+                    )
+                    continue
+                try:
+                    await _apply_mcp_change(action, name, new_url)
+                except Exception as e:
+                    await _send_json(
+                        websocket,
+                        {"type": "error", "message": f"mcp_config 应用失败: {e}"},
+                    )
+                    continue
+                await _send_json(
+                    websocket,
+                    {
+                        "type": "mcp_config",
+                        "servers": _mcp_servers_info(),
+                        "connected": mcp_client.connected,
+                        "tools": sorted(mcp_client.tool_names),
+                        "message": f"MCP 服务器已{('更新' if action == 'set' else '删除')}并重连: {name}",
+                    },
+                )
+            elif msg_type == "config":
+                if "sample_rate" in data:
+                    sr = int(data.get("sample_rate", DEFAULT_SAMPLE_RATE))
+                    if sr <= 0:
+                        await _send_json(
+                            websocket,
+                            {"type": "error", "message": "invalid sample_rate"},
+                        )
+                        continue
+                    sample_rate = sr
+                if "tts" in data:
+                    want = bool(data.get("tts"))
+                    tts_on = want and tts_model is not None
+                await _send_json(
+                    websocket,
+                    {
+                        "type": "status",
+                        "message": f"config ok sample_rate={sample_rate} tts={tts_on}",
+                        "kws_enabled": kws_session is not None,
+                        "tts_enabled": tts_on,
+                    },
+                )
+            elif msg_type in ("wake_gate", "wake_config"):
+                want = data.get("enabled")
+                if want is None:
+                    want = gate is not None
+                else:
+                    want = bool(want)
+                if want and gate is None:
+                    if sample_rate != DEFAULT_SAMPLE_RATE:
+                        await _send_json(
+                            websocket,
+                            {"type": "error", "message": "wake_gate 需要 16kHz sample_rate"},
+                        )
+                        continue
+                    if kws_session is None:
+                        await _send_json(
+                            websocket,
+                            {"type": "error", "message": "KWS 未启用，无法开启唤醒门控"},
+                        )
+                        continue
+                    try:
+                        vad = _get_shared_vad()
+                        vad.reset()
+                        gate = WakeGate(
+                            kws_session,
+                            vad,
+                            format_kws_message,
+                            one_shot=ONE_SHOT_MODE,
+                        )
+                    except Exception as e:
+                        await _send_json(
+                            websocket,
+                            {"type": "error", "message": f"wake_gate 初始化失败: {e}"},
+                        )
+                        continue
+                    audio_buf = bytearray()  # 丢弃门控前的缓冲残留
+                    print("[gate] 客户端启用唤醒门控（持续推流，无需 end）")
+                elif not want:
+                    gate = None
+                # 运行时调整唤醒控制时间（秒）：唤醒后等开口 / 连续对话窗口
+                if gate is not None:
+                    try:
+                        gate.set_timeouts(
+                            woken_timeout=data.get("woken_timeout"),
+                            followup_timeout=data.get("followup_timeout"),
+                        )
+                    except ValueError as e:
+                        await _send_json(websocket, {"type": "error", "message": str(e)})
+                        continue
+                await _send_json(
+                    websocket,
+                    {
+                        "type": "status",
+                        "message": f"wake_gate={'on' if gate is not None else 'off'}",
+                        "wake_gate": gate is not None,
+                        "woken_timeout": gate.woken_timeout if gate is not None else None,
+                        "followup_timeout": (
+                            gate.followup_timeout if gate is not None else None
+                        ),
+                    },
+                )
+            elif msg_type == "end":
+                if gate is not None:
+                    await _send_json(
+                        websocket,
+                        {"type": "error", "message": "wake_gate 模式下无需发送 end"},
+                    )
+                    continue
+                buf = audio_buf
+                audio_buf = bytearray()
+                hits = list(kws_hits_turn)
+                kws_hits_turn.clear()
+                await _process_utterance(
+                    websocket, buf, sample_rate, kws_hits=hits, tts_on=tts_on, mcast=mcast
+                )
+            else:
+                await _send_json(
+                    websocket,
+                    {"type": "error", "message": f"unknown type: {msg_type}"},
+                )
+    except (websockets.exceptions.ConnectionClosed, ClientGone):
+        print("client disconnected")
+    except Exception as e:
+        print(f"websocket error: {e}")
+        try:
+            await _send_json(websocket, {"type": "error", "message": str(e)})
+        except Exception:
+            pass
+    finally:
+        if mcast_task is not None:
+            mcast_task.cancel()
+            try:
+                await mcast_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if mcast is not None:
+            # 停 CMD_B 心跳并退组，硬件音源回待机
+            await mcast.stop()
+        if local_mic_task is not None:
+            local_mic_task.cancel()
+            try:
+                await local_mic_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if local_mic is not None:
+            await local_mic.stop()
+        if claimed_owner:
+            _release_mcast_owner(websocket)
+
+
+async def _auto_multicast_client():
+    """内部常驻客户端：连接本服务 /stream/multicast?auto=1，独占该组的处理权。"""
+    uri = (
+        f"ws://127.0.0.1:{PORT}{WS_PATH_MULTICAST}"
+        f"?group={AUTO_MULTICAST_GROUP}&port={AUTO_MULTICAST_PORT}&auto=1"
+    )
+    while True:
+        try:
+            print(f"[auto_mcast] connecting {uri}")
+            async with websockets.connect(uri) as ws:
+                print("[auto_mcast] auto multicast started")
+                async for msg in ws:
+                    if isinstance(msg, bytes):
+                        continue
+                    data = json.loads(msg)
+                    if data.get("type") == "error":
+                        print(f"[auto_mcast] server error: {data.get('message')}")
+        except Exception as e:
+            print(f"[auto_mcast] error: {type(e).__name__}: {e}, reconnecting in 2s")
+            await asyncio.sleep(2)
+
+
+async def _auto_local_mic_client():
+    """内部常驻客户端：连接本服务 /stream/local_mic?auto=1，保持自动本地麦一直运行。"""
+    uri = (
+        f"ws://127.0.0.1:{PORT}{WS_PATH_LOCAL_MIC}"
+        f"?device={AUTO_LOCAL_MIC_DEVICE}"
+        f"&rate={AUTO_LOCAL_MIC_RATE}"
+        f"&chunk={AUTO_LOCAL_MIC_CHUNK}"
+        f"&auto=1"
+    )
+    while True:
+        try:
+            print(f"[auto_mic] connecting {uri}")
+            async with websockets.connect(uri) as ws:
+                print("[auto_mic] auto local mic started")
+                async for msg in ws:
+                    if isinstance(msg, bytes):
+                        await _auto_local_mic_queue.put(msg)
+                    else:
+                        await _auto_local_mic_queue.put(json.loads(msg))
+        except Exception as e:
+            print(f"[auto_mic] error: {type(e).__name__}: {e}, reconnecting in 2s")
+            await asyncio.sleep(2)
+
+
+
+
+def _send_wav_to_multicast_sync(wav_bytes: bytes, group: str, port: int) -> dict:
+    """把 TTS 合成的 WAV 发送到指定组播地址（1280B 包，前 640B 音频 + 后 640B 零）。"""
+    import numpy as np
+    from speex_resample import resample
+
+    INPUT_RATE = 48000
+    OUTPUT_RATE = 16000
+    PACKET_BYTES = 1280
+    AUDIO_BYTES = 640
+
+    with io.BytesIO(wav_bytes) as bio:
+        with wave.open(bio, "rb") as wf:
+            nchannels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            framerate = wf.getframerate()
+            nframes = wf.getnframes()
+            raw = wf.readframes(nframes)
+    if sampwidth == 1:
+        pcm = np.frombuffer(raw, dtype=np.uint8).astype(np.int16) - 128
+    elif sampwidth == 2:
+        pcm = np.frombuffer(raw, dtype="<i2").copy()
+    else:
+        raise ValueError(f"unsupported sampwidth {sampwidth}")
+    if nchannels > 1:
+        pcm = pcm.reshape(-1, nchannels).mean(axis=1).astype(np.int16)
+    if framerate != OUTPUT_RATE:
+        pcm = resample(pcm, framerate, OUTPUT_RATE).astype(np.int16)
+    if pcm.size == 0:
+        return {"ok": False, "error": "empty pcm"}
+
+    f32 = pcm.astype(np.float32) / 32768.0
+    out48 = resample(f32, OUTPUT_RATE, INPUT_RATE)
+    pcm48 = (np.clip(out48, -1.0, 1.0) * 32767).astype("<i2")
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except (AttributeError, OSError):
+        pass
+    audio_samples = AUDIO_BYTES // 2
+    packet_interval = audio_samples / INPUT_RATE
+    sent = 0
+    try:
+        for i in range(0, len(pcm48), audio_samples):
+            audio_chunk = pcm48[i : i + audio_samples].tobytes()
+            if len(audio_chunk) < AUDIO_BYTES:
+                audio_chunk += bytes(AUDIO_BYTES - len(audio_chunk))
+            chunk = audio_chunk + bytes(PACKET_BYTES - AUDIO_BYTES)
+            sock.sendto(chunk, (group, port))
+            sent += 1
+            if i + audio_samples < len(pcm48):
+                time.sleep(packet_interval)
+    finally:
+        sock.close()
+    duration = len(pcm48) / INPUT_RATE
+    print(f"[tts-http] sent {sent} packets ({duration:.2f}s) target={group}:{port}")
+    return {"ok": True, "packets": sent, "duration": round(duration, 3)}
+
+
+class TtsHttpHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass
+
+    def _send_json(self, status: int, data: dict):
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+    def do_POST(self):
+        if self.path != "/v1/tts":
+            self._send_json(404, {"ok": False, "error": "not found"})
+            return
+        content_length = int(self.headers.get("Content-Length", 0))
+        if content_length <= 0:
+            self._send_json(400, {"ok": False, "error": "missing body"})
+            return
+        body = self.rfile.read(content_length)
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except Exception as e:
+            self._send_json(400, {"ok": False, "error": f"invalid json: {e}"})
+            return
+        text = str(payload.get("text", "")).strip()
+        if not text:
+            self._send_json(400, {"ok": False, "error": "text is required"})
+            return
+        if tts_model is None:
+            self._send_json(503, {"ok": False, "error": "tts not available"})
+            return
+
+        group = str(payload.get("group", TTS_MULTICAST_GROUP)).strip()
+        port = int(payload.get("port", TTS_MULTICAST_PORT))
+
+        try:
+            wav_path = tts_model.ort_predict(text)
+            if not wav_path or not os.path.isfile(wav_path):
+                self._send_json(500, {"ok": False, "error": "tts synthesis failed"})
+                return
+            wav_bytes = Path(wav_path).read_bytes()
+            result = _send_wav_to_multicast_sync(wav_bytes, group, port)
+            try:
+                os.unlink(wav_path)
+            except OSError:
+                pass
+            if result.get("ok"):
+                self._send_json(200, {
+                    "ok": True,
+                    "text": text,
+                    "group": group,
+                    "port": port,
+                    "byte_length": len(wav_bytes),
+                    "packets": result.get("packets"),
+                    "duration": result.get("duration"),
+                })
+            else:
+                self._send_json(500, {"ok": False, "error": result.get("error", "send failed")})
+        except Exception as e:
+            print(f"[tts-http] error: {e}")
+            self._send_json(500, {"ok": False, "error": str(e)})
+
+
+def _start_tts_http_server():
+    if not TTS_ENABLED_DEFAULT or tts_model is None:
+        print("[tts-http] TTS disabled, HTTP server not started")
+        return
+    server = http.server.HTTPServer((TTS_HTTP_HOST, TTS_HTTP_PORT), TtsHttpHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    print(f"[tts-http] listening on http://{TTS_HTTP_HOST}:{TTS_HTTP_PORT}/v1/tts")
+
+
+async def main():
+    global _wake_ack
+    await mcp_client.start()
+    loop = asyncio.get_running_loop()
+    if TTS_ENABLED_DEFAULT and tts_model is not None:
+        _wake_ack = await loop.run_in_executor(executor, _build_wake_ack)
+    # 启动预热模型（MODEL_WARMUP=0 可关闭）
+    if os.getenv("MODEL_WARMUP", "1").strip().lower() not in {"0", "false", "off", "no"}:
+        await loop.run_in_executor(executor, _warmup_models)
+    print(
+        f"ASR LLM WebSocket listening on ws://{HOST}:{PORT}{WS_PATH} (麦克风) / "
+        f"{WS_PATH_MULTICAST} (组播) / {WS_PATH_LOCAL_MIC} (本地麦克风)"
+    )
+    if mcp_client.describe():
+        print(
+            f"MCP: SSE client → {mcp_client.describe()}"
+            "（自动 initialize / tools/list，断线重连）"
+        )
+    else:
+        print("MCP: disabled（无 mcp.json 且 MCP_SSE_URL 为空，走纯 LLM 对话）")
+    print(f"KWS: {'enabled (并行检测上行 PCM)' if kws_engine else 'disabled'}")
+    print(
+        f"TTS: {'enabled (' + os.getenv('TTS_BACKEND', 'matcha') + ')' if tts_model is not None else 'disabled'}"
+    )
+    print(f"ONE_SHOT: {'enabled (一次控制后需再次唤醒)' if ONE_SHOT_MODE else 'disabled (连续对话窗口)'}")
+    _start_tts_http_server()
+    try:
+        async with serve(handler, HOST, PORT, max_size=16 * 1024 * 1024):
+            tasks: list[asyncio.Task] = []
+            if AUTO_MULTICAST:
+                print(
+                    f"[auto_mcast] enabled: group={AUTO_MULTICAST_GROUP} "
+                    f"port={AUTO_MULTICAST_PORT}"
+                )
+                tasks.append(asyncio.create_task(_auto_multicast_client()))
+            if AUTO_LOCAL_MIC:
+                print(
+                    f"[auto_mic] enabled: device={AUTO_LOCAL_MIC_DEVICE} "
+                    f"rate={AUTO_LOCAL_MIC_RATE} chunk={AUTO_LOCAL_MIC_CHUNK}"
+                )
+                tasks.append(asyncio.create_task(_auto_local_mic_client()))
+                tasks.append(asyncio.create_task(_broadcast_loop()))
+            await asyncio.Future()
+            for t in tasks:
+                t.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await t
+    finally:
+        await _auto_local_mic_queue.put(None)
+        await mcp_client.stop()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

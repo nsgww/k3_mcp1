@@ -1,0 +1,26 @@
+[Unit]
+Description=ASR LLM WebSocket Service
+After=network.target sound.target llama-server.service
+Wants=network.target sound.target llama-server.service
+StartLimitIntervalSec=30
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=bianbu
+Group=bianbu
+WorkingDirectory=/home/bianbu/Desktop/NLP2
+Environment=PYTHONPATH=/home/bianbu/Desktop/NLP2
+Environment=KWS_MODEL_DIR=/var/lib/sm-sdk/models/kws/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01
+Environment=TTS_MODEL_DIR=/var/lib/sm-sdk/models/tts/matcha-icefall-zh-en
+Environment=TTS_BACKEND=matcha
+Environment=MCP_CONFIG=/home/bianbu/Desktop/NLP2/mcp.json
+ExecStart=/home/bianbu/Desktop/NLP2/asr_mcp.sh
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=asr_llm_ws
+
+[Install]
+WantedBy=multi-user.target

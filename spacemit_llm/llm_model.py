@@ -1,0 +1,1079 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Callable, Optional
+
+import httpx
+from jsonschema.validators import validator_for
+
+MAX_TOOL_ROUNDS = int(os.getenv("MCP_MAX_TOOL_ROUNDS", "3"))
+# 一句话完整回复目标字数（生成侧约束；不是 TTS 盲目裁剪）
+REPLY_MAX_CHARS = int(os.getenv("LLM_MAX_CHARS", "15"))
+# 选型轮生成上限：无参 get_* 够用；过大只会拖慢 decode
+TOOL_NUM_PREDICT = int(os.getenv("MCP_TOOL_NUM_PREDICT", "64"))
+# LittleLamb 等文本 tool 模型：更短生成 + stop，避免 <think> 空转几十秒
+TEXT_TOOL_NUM_PREDICT = int(os.getenv("MCP_TEXT_TOOL_NUM_PREDICT", "48"))
+# 首轮没出 tool 时是否再问模型一次（会接近翻倍耗时）
+TOOL_RETRY = os.getenv("MCP_TOOL_RETRY", "0").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+}
+# After tools run ok, skip the summarize LLM round and let the caller
+# template-speak the result (the tiny model tends to burn the whole reply
+# budget on <think> there). Set MCP_SKIP_SUMMARIZE=0 to keep LLM summaries.
+SKIP_SUMMARIZE = os.getenv("MCP_SKIP_SUMMARIZE", "1").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+}
+# auto | native | text ；littlelamb 默认走 text（不传 Ollama tools=）
+TOOL_STYLE = (os.getenv("MCP_TOOL_STYLE") or "auto").strip().lower()
+# 是否开启工具设备名 post-call 校验（默认关闭）
+DEVICE_VALIDATE = os.getenv("MCP_TOOL_DEVICE_VALIDATE", "0").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+}
+
+
+def _compact_schema(schema: Any) -> dict:
+    """压缩非语义注解，但保留会影响参数合法性的 JSON Schema 约束。"""
+    if not isinstance(schema, dict):
+        return {"type": "object", "properties": {}}
+
+    keep = {
+        "type",
+        "description",
+        "enum",
+        "const",
+        "default",
+        "required",
+        "additionalProperties",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "minLength",
+        "maxLength",
+        "pattern",
+        "minItems",
+        "maxItems",
+        "uniqueItems",
+        "format",
+    }
+    out = {key: value for key, value in schema.items() if key in keep}
+    if "type" not in out:
+        out["type"] = "object"
+    properties = schema.get("properties")
+    out["properties"] = (
+        {
+            str(name): _compact_schema(value)
+            for name, value in properties.items()
+        }
+        if isinstance(properties, dict)
+        else {}
+    )
+    items = schema.get("items")
+    if isinstance(items, dict):
+        out["items"] = _compact_schema(items)
+    for keyword in ("oneOf", "anyOf", "allOf"):
+        variants = schema.get(keyword)
+        if isinstance(variants, list):
+            out[keyword] = [
+                _compact_schema(item) if isinstance(item, dict) else item
+                for item in variants
+            ]
+    return out
+
+
+def mcp_tools_to_ollama(tools: list[Any]) -> list[dict]:
+    """MCP Tool / dict → Ollama chat tools schema（压缩以加速选型）。"""
+    out: list[dict] = []
+    for t in tools or []:
+        if isinstance(t, dict):
+            name = str(t.get("name", "") or "")
+            desc = str(t.get("description", "") or "")
+            schema = t.get("inputSchema") or t.get("input_schema") or {"type": "object"}
+        else:
+            name = str(getattr(t, "name", "") or "")
+            desc = str(getattr(t, "description", "") or "")
+            schema = getattr(t, "input_schema", None) or {"type": "object"}
+        if not name:
+            continue
+        out.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": desc,
+                    "parameters": _compact_schema(schema),
+                },
+            }
+        )
+    return out
+
+
+def _tool_schema_map(tools: list[Any]) -> dict[str, dict]:
+    """保留 MCP 原始 inputSchema，供执行前校验。"""
+    schemas: dict[str, dict] = {}
+    for tool in tools or []:
+        if isinstance(tool, dict):
+            name = str(tool.get("name") or "")
+            schema = tool.get("inputSchema") or tool.get("input_schema")
+        else:
+            name = str(getattr(tool, "name", "") or "")
+            schema = getattr(tool, "input_schema", None)
+        if name:
+            schemas[name] = (
+                schema
+                if isinstance(schema, dict)
+                else {"type": "object", "properties": {}}
+            )
+    return schemas
+
+
+def _validate_tool_arguments(
+    name: str,
+    arguments: Any,
+    schemas: dict[str, dict],
+) -> Optional[str]:
+    """仅做精确工具名与 JSON Schema 校验，不修正任何业务语义。"""
+    if name not in schemas:
+        return f"未知工具: {name}"
+    if not isinstance(arguments, dict):
+        return "参数必须是 JSON object"
+    schema = schemas[name]
+    try:
+        validator_cls = validator_for(schema)
+        validator_cls.check_schema(schema)
+        errors = sorted(
+            validator_cls(schema).iter_errors(arguments),
+            key=lambda err: list(err.absolute_path),
+        )
+    except Exception as exc:
+        return f"工具 Schema 无效: {exc}"
+    if not errors:
+        return None
+    error = errors[0]
+    path = ".".join(str(part) for part in error.absolute_path)
+    where = f"参数 {path}" if path else "参数"
+    return f"{where}: {error.message}"
+
+
+# 从 tool description 提取设备名："打开办公室灯" -> "办公室灯"
+_DEVICE_ACTION_RE = re.compile(r"^(打开|关闭|查询|获取|设置|切换)(.+?)(状态|亮度|的信号)?$")
+
+
+def _extract_device_name(description: str) -> Optional[str]:
+    """从工具 description 提取受控设备名，无法提取则返回 None。"""
+    if not description:
+        return None
+    m = _DEVICE_ACTION_RE.match(description.strip())
+    if not m:
+        return None
+    name = m.group(2).strip("，,、。. ")
+    return name or None
+
+
+def _validate_tool_device(
+    name: str,
+    description: str,
+    user_text: str,
+) -> Optional[str]:
+    """
+    校验工具对应的设备名是否出现在用户原始消息中。
+    不存在则返回错误信息，阻止工具执行。
+    """
+    device = _extract_device_name(description)
+    if device is None:
+        # description 里没有可识别的设备名，不拦截
+        return None
+    if device in user_text:
+        return None
+    return f"ERROR: 设备不存在（{device}）"
+
+
+def _tool_select_options(*, text_style: bool = False) -> dict:
+    if text_style:
+        return {
+            "num_predict": TEXT_TOOL_NUM_PREDICT,
+            "temperature": 0,
+            "top_p": 0.9,
+            # 一出工具调用就停，避免继续空转
+            "stop": ["</tool_call>", "<|im_end|>"],
+        }
+    return {
+        "num_predict": TOOL_NUM_PREDICT,
+        "temperature": 0,
+        "top_p": 0.9,
+    }
+
+
+def _reply_options() -> dict:
+    return {
+        "num_predict": max(24, REPLY_MAX_CHARS * 3),
+        "temperature": 0.3,
+        "stop": ["<|im_end|>"],
+    }
+
+
+def _use_text_tool_style(model_path: str) -> bool:
+    """LittleLamb 类模型用正文 <tool_call>，不走 Ollama native tools=。"""
+    if TOOL_STYLE in {"text", "xml", "tool_call"}:
+        return True
+    if TOOL_STYLE in {"native", "ollama"}:
+        return False
+    name = (model_path or "").lower()
+    return "littlelamb" in name or "little-lamb" in name
+
+
+def _tools_prompt_block(ollama_tools: list[dict]) -> str:
+    """把工具表塞进 system，供文本 tool 模型阅读。"""
+    lines = [
+        "可用工具（name 必须原样使用；按 description 选择，勿混淆）：",
+    ]
+    for t in ollama_tools:
+        fn = t.get("function") or {}
+        name = fn.get("name") or ""
+        desc = fn.get("description") or ""
+        lines.append(f"- {name}: {desc}")
+    lines.append(
+        "需要调用时只输出 tool_call，name 必须是上表真实工具名；"
+        "不要解释，不要 <think>。\n"
+        "<tool_call>\n"
+        '{"name":"真实工具名","arguments":{}}\n'
+        "</tool_call>"
+    )
+    return "\n".join(lines)
+
+
+def _message_to_dict(msg: Any) -> dict:
+    if isinstance(msg, dict):
+        return msg
+    if hasattr(msg, "model_dump"):
+        return msg.model_dump(exclude_none=True)
+    role = getattr(msg, "role", "assistant")
+    content = getattr(msg, "content", None) or ""
+    data: dict[str, Any] = {"role": role, "content": content}
+    tool_calls = getattr(msg, "tool_calls", None)
+    if tool_calls:
+        data["tool_calls"] = tool_calls
+    return data
+
+
+def _extract_tool_calls(message: Any) -> list[tuple[str, dict]]:
+    raw = getattr(message, "tool_calls", None)
+    if raw is None and isinstance(message, dict):
+        raw = message.get("tool_calls")
+    if not raw:
+        return []
+    calls: list[tuple[str, dict]] = []
+    for tc in raw:
+        if isinstance(tc, dict):
+            fn = tc.get("function") or {}
+            name = str(fn.get("name") or "").strip()
+            args = fn.get("arguments") or {}
+        else:
+            fn = getattr(tc, "function", None)
+            name = str(getattr(fn, "name", "") or "").strip()
+            args = getattr(fn, "arguments", None) or {}
+        if isinstance(args, str):
+            try:
+                args = json.loads(args) if args else {}
+            except json.JSONDecodeError:
+                args = {}
+        if not isinstance(args, dict):
+            args = {}
+        if name:
+            calls.append((name, args))
+    return calls
+
+
+def _parse_args_blob(blob: str) -> dict:
+    m = re.search(r'"arguments"\s*:\s*(\{.*)', blob, re.S)
+    if not m:
+        return {}
+    raw = m.group(1).strip()
+    for end in range(len(raw), 1, -1):
+        chunk = raw[:end]
+        if not chunk.endswith("}"):
+            continue
+        try:
+            val = json.loads(chunk)
+            return val if isinstance(val, dict) else {}
+        except json.JSONDecodeError:
+            continue
+    return {}
+
+
+def _looks_like_tool_markup(text: str) -> bool:
+    """仅识别工具调用协议残片，不做业务意图判断。"""
+    t = (text or "").lstrip().lower()
+    if not t:
+        return False
+    return (
+        t.startswith("<tool_call")
+        or t.startswith("```")
+        or t.startswith('{"name"')
+        or (t.startswith("{") and '"name"' in t[:80])
+        or bool(re.match(r"^[a-z][a-z0-9_]{3,}$", t))
+    )
+
+
+def _resolve_tool_name(name: str, allowed: set[str]) -> str:
+    """只接受 tools/list 暴露的精确工具名。"""
+    name = (name or "").strip().strip("`\"'")
+    return name if name in allowed else ""
+
+
+def _bare_tool_name_from_text(text: str, allowed: set[str]) -> str:
+    """兼容正文直接输出精确工具名，不接受半截名或近似名。"""
+    t = _strip_think(text or "").strip().strip("`\"'")
+    if not t or len(t) > 96:
+        return ""
+    # 整段就是一个标识符
+    m = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]{2,80})", t)
+    if m:
+        return _resolve_tool_name(m.group(1), allowed)
+    # 正文里唯一的工具风格 token
+    tokens = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]{3,80})\b", t)
+    resolved: list[str] = []
+    for tok in tokens:
+        hit = _resolve_tool_name(tok, allowed)
+        if hit and hit not in resolved:
+            resolved.append(hit)
+    if len(resolved) == 1:
+        return resolved[0]
+    return ""
+
+
+def _calls_from_text(content: str, allowed: set[str]) -> list[tuple[str, dict]]:
+    """
+    解析正文中的工具调用协议：
+      <tool_call> / JSON "name" / 精确裸工具名。
+    不做「走廊/办公室」等业务意图匹配。
+    """
+    text = content or ""
+    if not text or not allowed:
+        return []
+    found: list[tuple[str, dict]] = []
+    seen: set[str] = set()
+
+    def add(name: str, args: Optional[dict] = None) -> None:
+        resolved = _resolve_tool_name(name, allowed)
+        if resolved and resolved not in seen:
+            seen.add(resolved)
+            found.append((resolved, args or {}))
+
+    for m in re.finditer(
+        r"<tool_call>\s*(.*?)(?:</tool_call>|$)", text, flags=re.I | re.S
+    ):
+        blob = m.group(1)
+        name_m = re.search(r'"name"\s*:\s*"([^"]+)"', blob)
+        if name_m:
+            add(name_m.group(1), _parse_args_blob(blob))
+
+    if found:
+        return found
+
+    for m in re.finditer(r'"name"\s*:\s*"([^"]+)"', text):
+        add(m.group(1), {})
+    if found:
+        return found
+
+    bare = _bare_tool_name_from_text(text, allowed)
+    if bare:
+        print(f"[agent] bare tool name: {text.strip()!r} -> {bare!r}")
+        return [(bare, {})]
+    return found
+
+
+def _is_status_tool(name: str) -> bool:
+    """get_* 查询类工具：结果可由模板播报，无需再跑一轮 LLM。"""
+    return (name or "").startswith("get_")
+
+
+def _raw_content(message: Any) -> str:
+    if isinstance(message, dict):
+        return (message.get("content") or "").strip()
+    return (getattr(message, "content", None) or "").strip()
+
+
+def _raw_thinking(message: Any) -> str:
+    """Newer Ollama puts reasoning in message.thinking, not content."""
+    if isinstance(message, dict):
+        return (message.get("thinking") or "").strip()
+    return (getattr(message, "thinking", None) or "").strip()
+
+
+def _strip_think(text: str) -> str:
+    """
+    去掉 <think>…</think>。
+    未闭合的 <think> 只删到下一个 <tool_call>，避免把后面的工具调用一起吃掉。
+    """
+    if not text:
+        return ""
+    text = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.I)
+    text = re.sub(
+        r"<think>[\s\S]*?(?=<tool_call>|$)",
+        "",
+        text,
+        flags=re.I,
+    )
+    return text.strip()
+
+
+def _msg_content(message: Any) -> str:
+    return _strip_think(_raw_content(message))
+
+
+def finalize_reply(text: str, max_chars: Optional[int] = None) -> str:
+    """
+    收成「完整短句」：优先保留句末标点内的完整一句，而不是盲目 [:N] 裁剪。
+    工具调用残片不会当作口播内容。
+    """
+    max_chars = REPLY_MAX_CHARS if max_chars is None else int(max_chars)
+    text = (text or "").strip()
+    if not text or max_chars <= 0:
+        return ""
+    if _looks_like_tool_markup(text):
+        return ""
+
+    text = re.sub(r"^```\w*\n?|\n?```$", "", text).strip()
+    if len(text) <= max_chars:
+        return text
+
+    window = text[:max_chars]
+    for punct in ("。", "！", "？", "…", "!", "?"):
+        idx = window.rfind(punct)
+        if idx >= 0:
+            return window[: idx + 1]
+    for punct in ("，", "、", "；", ",", ";", " "):
+        idx = window.rfind(punct)
+        if idx >= 3:
+            return window[:idx]
+    return window
+
+
+def _resolve_llm_model(explicit: str = "") -> str:
+    """
+    模型名优先级（09 进程启动时读一次，改环境变量后需重启 09）：
+      1) 构造参数 llm_model_path（非空时）
+      2) 环境变量 MCP_TOOL_LLM / OLLAMA_MODEL / LLM_MODEL
+      3) 默认 littlelamb:latest
+    """
+    explicit = (explicit or "").strip()
+    if explicit:
+        return explicit
+    for key in ("MCP_TOOL_LLM", "OLLAMA_MODEL", "LLM_MODEL"):
+        env = (os.getenv(key) or "").strip()
+        if env:
+            return env
+    return "littlelamb:latest"
+
+
+def _openai_chat_endpoint(base_url: str) -> str:
+    base = (base_url or "http://127.0.0.1:8080").rstrip("/")
+    if base.endswith("/v1"):
+        return f"{base}/chat/completions"
+    return f"{base}/v1/chat/completions"
+
+
+def _build_tool_sys_prompt(ollama_tools: list[dict], text_style: bool) -> str:
+    """构造工具选型 Agent 的 system prompt（warmup 与 run_tool_agent 共用）。"""
+    sys_prompt = f"""
+                    你是智能家居设备控制助手。
+                    设备控制必须调用工具，禁止编造结果。
+                    设备名只能使用当前用户消息中明确提到且工具支持的设备。
+                    不得使用上一轮的设备名。
+                    设备不存在时直接返回“设备不存在”，禁止替换。
+                    工具参数必须准确。
+                    闲聊只回答一句中文，不超过 {REPLY_MAX_CHARS} 字。
+                    """
+    if text_style and ollama_tools:
+        sys_prompt += "\n" + _tools_prompt_block(ollama_tools)
+class LLMModel:
+    def __init__(
+        self,
+        llm_model_path: str = "",
+        stream: bool = True,
+    ):
+        self._model_path = _resolve_llm_model(llm_model_path)
+        self._stream = stream
+        self._backend = (
+            os.getenv("LLM_BACKEND", "ollama").strip().lower().replace("_", "-")
+        )
+        if self._backend not in {"ollama", "llama-server", "openai"}:
+            raise ValueError(
+                f"不支持的 LLM_BACKEND={self._backend!r}，"
+                "可选 ollama / llama-server / openai"
+            )
+        self._base_url = os.getenv(
+            "LLM_BASE_URL", "http://127.0.0.1:8080"
+        ).strip()
+        self._api_key = os.getenv("LLM_API_KEY", "").strip()
+        self._request_timeout = float(os.getenv("LLM_REQUEST_TIMEOUT", "300"))
+        # None = unknown, True = think=False accepted, False = client/server
+        # does not support the think kwarg; avoids double 80s calls on retry.
+        self._think_disabled: Optional[bool] = None
+        print(
+            f"[LLM] backend={self._backend} model={self._model_path} "
+            f"reply_max={REPLY_MAX_CHARS} "
+            f"(override: MCP_TOOL_LLM / OLLAMA_MODEL / LLM_MODEL)"
+        )
+
+    def _chat(self, **kwargs) -> Any:
+        """按配置调用 Ollama 或 llama-server/OpenAI 兼容接口。"""
+        if self._backend in {"llama-server", "openai"}:
+            return self._openai_chat(**kwargs)
+        return self._ollama_chat(**kwargs)
+
+    def warmup_tool_prompt(self, tools: list[Any]) -> None:
+        """把 system prompt + tool schema 预热进 llama-server prompt cache。"""
+        if not tools:
+            print("[warmup] no tools, skip tool prompt warmup")
+            return
+        try:
+            t0 = time.perf_counter()
+            ollama_tools = mcp_tools_to_ollama(tools)
+            text_style = _use_text_tool_style(self._model_path)
+            sys_prompt = _build_tool_sys_prompt(ollama_tools, text_style)
+            messages = [
+                {"role": "system", "content": sys_prompt},
+                {
+                    "role": "user",
+                    "content": "ping\n/no_think" if text_style else "ping",
+                },
+            ]
+            self._chat(
+                model=self._model_path,
+                messages=messages,
+                tools=ollama_tools,
+                stream=False,
+                options={"num_predict": 1, "temperature": 0.3},
+            )
+            print(
+                f"[warmup] tool prompt cached ({time.perf_counter() - t0:.1f}s, "
+                f"tools={len(ollama_tools)})"
+            )
+        except Exception as e:
+            print(f"[warmup] tool prompt warmup failed: {e}")
+
+    def _ollama_chat(self, **kwargs) -> Any:
+        """Ollama chat() with thinking disabled when supported.
+
+        LittleLamb/Qwen3-style models otherwise burn the whole num_predict
+        budget on <think> reasoning and never reach the <tool_call>.
+        """
+        from ollama import chat
+
+        if self._think_disabled is not False:
+            try:
+                resp = chat(**kwargs, think=False)
+                self._think_disabled = True
+                return resp
+            except TypeError:
+                self._think_disabled = False
+            except Exception as e:
+                if "think" not in str(e).lower():
+                    raise
+                self._think_disabled = False
+                print(f"[agent] think=False rejected, fallback: {e}")
+        return chat(**kwargs)
+
+    def _openai_headers(self) -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        return headers
+
+    @staticmethod
+    def _as_openai_messages(messages: list[dict]) -> list[dict]:
+        """去掉 Ollama 私有字段，并补齐 OpenAI tool_call_id。"""
+        converted: list[dict] = []
+        for index, raw in enumerate(messages or []):
+            message = dict(raw)
+            role = str(message.get("role") or "user")
+            out: dict[str, Any] = {
+                "role": role,
+                "content": message.get("content") or "",
+            }
+            if role == "assistant" and message.get("tool_calls"):
+                calls = []
+                for call_index, call in enumerate(message["tool_calls"]):
+                    fn = (
+                        call.get("function") or {}
+                        if isinstance(call, dict)
+                        else {}
+                    )
+                    arguments = fn.get("arguments") or {}
+                    if not isinstance(arguments, str):
+                        arguments = json.dumps(arguments, ensure_ascii=False)
+                    calls.append(
+                        {
+                            "id": str(
+                                call.get("id")
+                                or f"call_{index}_{call_index}"
+                            ),
+                            "type": "function",
+                            "function": {
+                                "name": str(fn.get("name") or ""),
+                                "arguments": arguments,
+                            },
+                        }
+                    )
+                out["tool_calls"] = calls
+            elif role == "tool":
+                out["tool_call_id"] = str(
+                    message.get("tool_call_id")
+                    or message.get("tool_name")
+                    or f"call_{index}"
+                )
+            converted.append(out)
+        return converted
+
+    @staticmethod
+    def _normalize_openai_response(data: dict) -> dict:
+        choices = data.get("choices") or []
+        if not choices:
+            raise RuntimeError(f"LLM 响应缺少 choices: {data}")
+        source = choices[0].get("message") or {}
+        message: dict[str, Any] = {
+            "role": source.get("role") or "assistant",
+            "content": source.get("content") or "",
+        }
+        if source.get("reasoning_content"):
+            message["thinking"] = source["reasoning_content"]
+        if source.get("tool_calls"):
+            message["tool_calls"] = source["tool_calls"]
+        usage = data.get("usage") or {}
+        return {
+            "message": message,
+            "prompt_eval_count": usage.get("prompt_tokens"),
+            "eval_count": usage.get("completion_tokens"),
+        }
+
+    def _openai_stream(self, endpoint: str, payload: dict):
+        with httpx.stream(
+            "POST",
+            endpoint,
+            headers=self._openai_headers(),
+            json=payload,
+            timeout=self._request_timeout,
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                body = line[5:].strip()
+                if body == "[DONE]":
+                    break
+                data = json.loads(body)
+                choices = data.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                content = delta.get("content") or ""
+                if content:
+                    yield {"message": {"content": content}}
+
+    def _openai_chat(self, **kwargs) -> Any:
+        options = dict(kwargs.get("options") or {})
+        payload: dict[str, Any] = {
+            "model": kwargs.get("model") or self._model_path,
+            "messages": self._as_openai_messages(
+                list(kwargs.get("messages") or [])
+            ),
+            "stream": bool(kwargs.get("stream", False)),
+        }
+        # Qwen3 等 thinking 模型：默认关闭思考，避免 tool 选型轮把
+        # num_predict/max_tokens 预算烧在 <think> 上导致空回复（未识别指令）。
+        # 与 _ollama_chat 的 think=False 对齐；LLM_DISABLE_THINKING=0 可恢复。
+        if os.getenv("LLM_DISABLE_THINKING", "1").strip().lower() not in {
+            "0",
+            "false",
+            "off",
+            "no",
+        }:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        option_map = {
+            "num_predict": "max_tokens",
+            "temperature": "temperature",
+            "top_p": "top_p",
+            "stop": "stop",
+        }
+        for source, target in option_map.items():
+            if source in options:
+                payload[target] = options[source]
+        tools = kwargs.get("tools")
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+
+        endpoint = _openai_chat_endpoint(self._base_url)
+        if payload["stream"]:
+            return self._openai_stream(endpoint, payload)
+        response = httpx.post(
+            endpoint,
+            headers=self._openai_headers(),
+            json=payload,
+            timeout=self._request_timeout,
+        )
+        response.raise_for_status()
+        return self._normalize_openai_response(response.json())
+
+    def get_chat_stream(self, text, messages):
+        messages.append({"role": "user", "content": text})
+        stream = self._chat(
+            model=self._model_path,
+            messages=messages,
+            stream=self._stream,
+            options=_reply_options(),
+        )
+        return stream
+
+    def generate(self, text):
+        self.messages = [
+            {
+                "role": "system",
+                "content": (
+                    "你是一个问答助手。"
+                    f"用中文完整回答，只能一句话，不超过{REPLY_MAX_CHARS}个字。\n"
+                ),
+            }
+        ]
+        stream = self.get_chat_stream(text, self.messages)
+        for chunk in stream:
+            content = chunk["message"]["content"]
+            yield content
+
+    def run_tool_agent(
+        self,
+        text: str,
+        tools: list[Any],
+        execute_tool: Callable[[str, dict], str],
+        *,
+        max_rounds: Optional[int] = None,
+    ) -> dict:
+        """
+        MCP Host 循环：选型与理解全部交给模型（tools schema + description）。
+
+        速度相关：
+          - 压缩 tools schema、temperature=0、限制 num_predict
+          - get_* 成功跳过总结 LLM；多工具并行调用
+          - 默认不做二次「请发起 tool」重试（MCP_TOOL_RETRY=1 可开）
+        """
+        t_all = time.perf_counter()
+        llm_ms = 0.0
+        mcp_ms = 0.0
+
+        ollama_tools = mcp_tools_to_ollama(tools)
+        tool_schemas = _tool_schema_map(tools)
+        allowed = {t["function"]["name"] for t in ollama_tools}
+        text_style = _use_text_tool_style(self._model_path)
+        max_rounds = max_rounds if max_rounds is not None else MAX_TOOL_ROUNDS
+        # sys_parts = [
+        #     "你是智能家居设备控制助手。",
+        #     "需要控制设备时必须调用工具，不要自己编造执行结果。",
+        #     "设备名称必须严格来自工具提供的设备列表。",
+        #     "只能使用用户当前消息中的设备名称。",
+        #     "禁止继承上一轮对话中的设备名称。",
+        #     "如果用户指定的设备不存在，不允许替换成其他设备，应返回设备不存在。",
+        #     "调用工具时必须准确填写参数。",
+        #     "闲聊时只用一句中文回答。",
+        #     f"口播不超过{REPLY_MAX_CHARS}字。",
+        #     "不要输出 <think>。",
+        # ]
+
+        # sys_prompt = f"""你是智能家居控制助手。
+        #                 设备控制：必须调用工具，禁止编造结果。
+        #                 设备名：只能使用当前用户消息中、且工具提供的设备名；不存在则报告“设备不存在”，禁止替换。
+        #                 参数：必须准确填写。
+        #                 闲聊：一句中文回答。
+        #                 口播：不超过 {REPLY_MAX_CHARS} 字。
+        #                 禁止输出 <think>。"""
+
+        sys_prompt = _build_tool_sys_prompt(ollama_tools, text_style)
+        messages: list[dict] = [
+            {"role": "system", "content": sys_prompt},
+            {
+                "role": "user",
+                "content": f"{text}\n/no_think" if text_style else text,
+            },
+        ]
+        executed: list[dict] = []
+        rounds = 0
+        final_content = ""
+        asked_tool_retry = False
+        print(
+            f"[agent] model={self._model_path} tool_style="
+            f"{'text' if text_style else 'native'} tools={len(ollama_tools)}"
+        )
+
+        if not ollama_tools:
+            t0 = time.perf_counter()
+            resp = self._chat(
+                model=self._model_path,
+                messages=messages,
+                stream=False,
+                options=_reply_options(),
+            )
+            llm_ms += (time.perf_counter() - t0) * 1000
+            message = resp["message"] if isinstance(resp, dict) else resp.message
+            final_content = finalize_reply(_msg_content(message)) or "好的"
+            print(f"[agent] timing llm={llm_ms:.0f}ms mcp=0ms total={(time.perf_counter()-t_all)*1000:.0f}ms")
+            return {"content": final_content, "calls": [], "rounds": 0}
+
+        while rounds < max_rounds:
+            rounds += 1
+            chat_kwargs: dict[str, Any] = {
+                "model": self._model_path,
+                "messages": messages,
+                "stream": False,
+            }
+            if not executed:
+                # littlelamb：不传 tools=，靠 system 里的工具表 + 解析 <tool_call>
+                if not text_style:
+                    chat_kwargs["tools"] = ollama_tools
+                chat_kwargs["options"] = _tool_select_options(text_style=text_style)
+            else:
+                chat_kwargs["options"] = _reply_options()
+            try:
+                t0 = time.perf_counter()
+                resp = self._chat(**chat_kwargs)
+                llm_ms += (time.perf_counter() - t0) * 1000
+            except Exception as e:
+                print(f"[agent] chat error: {e}")
+                return {
+                    "content": final_content or f"模型调用失败: {e}",
+                    "calls": executed,
+                    "rounds": rounds,
+                }
+
+            message = resp["message"] if isinstance(resp, dict) else resp.message
+            raw = _raw_content(message)
+            thinking = _raw_thinking(message)
+            parse_src = f"{thinking}\n{raw}".strip() if thinking else raw
+            content = _strip_think(raw)
+            if isinstance(resp, dict):
+                _ev = resp.get("eval_count")
+                _pe = resp.get("prompt_eval_count")
+            else:
+                _ev = getattr(resp, "eval_count", None)
+                _pe = getattr(resp, "prompt_eval_count", None)
+            # gen == num_predict cap means output was truncated (usually mid-think)
+            print(f"[agent] round {rounds} tokens: prompt={_pe} gen={_ev}")
+            tool_calls = [] if text_style else _extract_tool_calls(message)
+            text_fallback = False
+            if not tool_calls:
+                # 必须用 raw 解析：tool_call 可能在 <think> 之后
+                tool_calls = _calls_from_text(parse_src, allowed)
+                if tool_calls:
+                    text_fallback = True
+                    print(
+                        f"[agent] text-fallback tool_calls: "
+                        f"{[n for n, _ in tool_calls]}"
+                    )
+            if not tool_calls and not content:
+                print(
+                    f"[agent] empty after think; "
+                    f"thinking[:120]={thinking[:120]!r} raw[:180]={raw[:180]!r}"
+                )
+
+            if tool_calls and text_fallback:
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": f"call_{uuid.uuid4().hex}",
+                                "type": "function",
+                                "function": {
+                                    "name": n,
+                                    "arguments": a or {},
+                                },
+                            }
+                            for n, a in tool_calls
+                        ],
+                    }
+                )
+            else:
+                messages.append(_message_to_dict(message))
+
+            tool_call_ids: list[str] = []
+            assistant_calls = (
+                messages[-1].get("tool_calls") or []
+                if messages and isinstance(messages[-1], dict)
+                else []
+            )
+            for call_index, call in enumerate(assistant_calls):
+                if not isinstance(call, dict):
+                    tool_call_ids.append(f"call_{rounds}_{call_index}")
+                    continue
+                call_id = str(
+                    call.get("id")
+                    or f"call_{uuid.uuid4().hex}"
+                )
+                call["id"] = call_id
+                tool_call_ids.append(call_id)
+
+            if not tool_calls:
+                if TOOL_RETRY and not executed and not asked_tool_retry:
+                    asked_tool_retry = True
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "如果需要查询或控制设备，请直接发起 tool/function 调用；"
+                                "不要只用文字说明。"
+                            ),
+                        }
+                    )
+                    print("[agent] retry: ask model for tool_calls")
+                    continue
+                if _looks_like_tool_markup(content) or _looks_like_tool_markup(raw):
+                    print(
+                        "[agent] drop unparsed tool markup from reply; "
+                        f"raw[:180]={raw[:180]!r}"
+                    )
+                    # tools already ran: let the caller template-speak the result
+                    final_content = "" if executed else "未识别指令"
+                elif executed and not content:
+                    # summarize round truncated mid-think; template fallback
+                    final_content = ""
+                else:
+                    final_content = finalize_reply(content) or (
+                        "" if executed else "未识别指令"
+                    )
+                break
+
+            if executed:
+                print(
+                    f"[agent] summarize round ignored tool_calls: "
+                    f"{[n for n, _ in tool_calls]}"
+                )
+                # content 为空时留 ""，与上方 730/733 行一致：
+                # 交给调用方 _summarize_tool_results 模板播报实际结果，
+                # 避免查询类指令只播一句「已执行」
+                final_content = finalize_reply(content) or ""
+                break
+
+            desc_map = {
+                (t.get("function") or {}).get("name"): (t.get("function") or {}).get(
+                    "description"
+                )
+                or ""
+                for t in ollama_tools
+            }
+            print(
+                f"[agent] round {rounds} tool_calls: "
+                + ", ".join(
+                    f"{n}({desc_map.get(n, '')})" for n, _ in tool_calls
+                )
+            )
+
+            def _one(name: str, args: Any) -> tuple[str, Any, str, bool]:
+                validation_error = _validate_tool_arguments(
+                    name, args, tool_schemas
+                )
+                if validation_error:
+                    result_text = f"ERROR: 工具调用校验失败: {validation_error}"
+                    print(f"[agent] reject {name}: {validation_error}")
+                    return name, args, result_text, False
+
+                # 动态设备名校验（默认关闭，MCP_TOOL_DEVICE_VALIDATE=1 开启）
+                if DEVICE_VALIDATE:
+                    device_error = _validate_tool_device(
+                        name, desc_map.get(name, ""), text
+                    )
+                    if device_error:
+                        print(
+                            f"[agent] reject {name}: device mismatch "
+                            f"(description={desc_map.get(name, '')!r}, user={text!r})"
+                        )
+                        return name, args, device_error, False
+
+                try:
+                    result_text = execute_tool(name, args) or ""
+                    ok = not str(result_text).startswith("ERROR:")
+                except Exception as e:
+                    result_text = f"ERROR: {e}"
+                    ok = False
+                return name, args, result_text, ok
+
+            t0 = time.perf_counter()
+            if len(tool_calls) == 1:
+                results = [_one(tool_calls[0][0], tool_calls[0][1])]
+            else:
+                with ThreadPoolExecutor(
+                    max_workers=min(4, len(tool_calls))
+                ) as pool:
+                    futs = [pool.submit(_one, n, a) for n, a in tool_calls]
+                    # 按提交顺序回收，保证播报顺序稳定
+                    results = [fut.result() for fut in futs]
+            mcp_ms += (time.perf_counter() - t0) * 1000
+
+            for result_index, (name, args, result_text, ok) in enumerate(results):
+                executed.append(
+                    {
+                        "name": name,
+                        "arguments": args,
+                        "result": result_text if ok else "",
+                        "error": None if ok else result_text,
+                        "ok": ok,
+                    }
+                )
+                tool_message = {
+                    "role": "tool",
+                    "tool_name": name,
+                    "content": result_text,
+                }
+                if getattr(self, "_backend", "ollama") in {
+                    "llama-server",
+                    "openai",
+                }:
+                    tool_message["tool_call_id"] = (
+                        tool_call_ids[result_index]
+                        if result_index < len(tool_call_ids)
+                        else f"call_{uuid.uuid4().hex}"
+                    )
+                messages.append(tool_message)
+
+            all_ok = all(c["ok"] for c in executed)
+            if all_ok and (
+                SKIP_SUMMARIZE
+                or all(_is_status_tool(n) for n, _ in tool_calls)
+            ):
+                print(
+                    f"[agent] tools ok -> skip summarize LLM "
+                    f"tools={[n for n, _ in tool_calls]}"
+                )
+                final_content = ""
+                break
+        else:
+            if not final_content and messages:
+                last = messages[-1]
+                if isinstance(last, dict) and last.get("role") == "assistant":
+                    final_content = finalize_reply(last.get("content") or "")
+
+        total_ms = (time.perf_counter() - t_all) * 1000
+        print(
+            f"[agent] timing llm={llm_ms:.0f}ms mcp={mcp_ms:.0f}ms "
+            f"total={total_ms:.0f}ms rounds={rounds}"
+        )
+        return {
+            "content": final_content,
+            "calls": executed,
+            "rounds": rounds,
+        }

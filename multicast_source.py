@@ -1,0 +1,565 @@
+"""UDP 组播 PCM 音源（协议与 multi-stream-asr MulticastAudioSource / sm-sdk 一致）。
+
+- 源端向组播组发 48kHz PCM16 单声道包：1280 字节/包，前 640 字节为有效音频
+- 收端每 5s 向组播组发 CMD_B 心跳，唤醒硬件音源开播；stop() 停心跳并退组
+- 输出：48k→16k Speex 重采样后攒成 32ms（1024B）PCM16 字节帧进队列
+
+环境变量：
+  MCAST_GROUP  默认 224.2.1.168
+  MCAST_PORT   默认 6020
+"""
+
+from __future__ import annotations
+
+import asyncio
+import io
+import os
+import socket
+import struct
+import subprocess
+import time
+import wave
+
+import numpy as np
+
+from speex_resample import SpeexResampler, resample
+
+MCAST_GROUP = os.getenv("MCAST_GROUP", "224.2.1.168")
+MCAST_PORT = int(os.getenv("MCAST_PORT", "6020"))
+
+INPUT_RATE = 48000
+OUTPUT_RATE = 16000
+PACKET_BYTES = 1280
+AUDIO_BYTES = 640          # 每包前 640 字节有效（320 采样 @48k ≈ 6.67ms）
+FRAME_BYTES = 1024         # 输出帧：512 采样 @16k = 32ms
+HEARTBEAT_PAYLOAD = b"CMD_B"
+QUEUE_MAX = 100            # 满则丢新帧（≈3.2s 积压上限）
+
+
+class TtsHeartbeatMonitor:
+    """监听 TTS 输出组播组上的 CMD_B 心跳，用于判断接收端是否在线。
+
+    音频板往往往 TTS 输出组播组发心跳（而不是输入组），k3_mcp1 发 TTS 前
+    可先检查是否收到过指定 IP 的心跳。
+    """
+
+    def __init__(self, group: str, port: int, timeout: float = 10.0) -> None:
+        self.group = group
+        self.port = int(port)
+        self.timeout = float(timeout)
+        self._sources: dict[str, float] = {}
+        self._socket: socket.socket | None = None
+        self._mreqs: list[bytes] = []
+        self._task: asyncio.Task[None] | None = None
+        self._stopped = True
+
+    async def start(self) -> None:
+        if not self._stopped:
+            return
+        self._stopped = False
+        await asyncio.to_thread(self._join_sync)
+        self._task = asyncio.create_task(self._loop())
+        print(f"[mcast-hb] 开始监听 TTS 心跳 {self.group}:{self.port}")
+
+    async def stop(self) -> None:
+        self._stopped = True
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        if self._socket is not None:
+            for mreq in self._mreqs:
+                try:
+                    self._socket.setsockopt(socket.IPPROTO_IP, socket.IP_DROP_MEMBERSHIP, mreq)
+                except OSError:
+                    pass
+            self._mreqs = []
+            self._socket.close()
+            self._socket = None
+
+    def has_heartbeat_from(self, ip: str) -> bool:
+        if not ip:
+            return True
+        last = self._sources.get(ip)
+        if last is None:
+            return False
+        return (time.time() - last) <= self.timeout
+
+    def _join_sync(self) -> None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except (AttributeError, OSError):
+            pass
+        try:
+            sock.bind((self.group, self.port))
+        except OSError as exc:
+            print(f"[mcast-hb] bind({self.group},{self.port}) 失败({exc})，回退 0.0.0.0")
+            sock.bind(("0.0.0.0", self.port))
+        if hasattr(socket, "IP_MULTICAST_ALL"):
+            try:
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_ALL, 1)
+            except OSError:
+                pass
+        for ifname, iface_ip, ifindex in _list_iface_ipv4():
+            candidates: list[bytes] = []
+            if ifindex > 0:
+                candidates.append(
+                    struct.pack("4s4si", socket.inet_aton(self.group),
+                                socket.inet_aton("0.0.0.0"), ifindex)
+                )
+            if iface_ip not in ("", "0.0.0.0"):
+                candidates.append(
+                    struct.pack("4s4s", socket.inet_aton(self.group),
+                                socket.inet_aton(iface_ip))
+                )
+            if not candidates:
+                candidates.append(
+                    struct.pack("4sl", socket.inet_aton(self.group), socket.INADDR_ANY)
+                )
+            for mreq in candidates:
+                try:
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+                    self._mreqs.append(mreq)
+                    break
+                except OSError:
+                    pass
+        if not self._mreqs:
+            sock.close()
+            raise RuntimeError(f"[mcast-hb] 加入 {self.group}:{self.port} 失败")
+        sock.settimeout(1.0)
+        self._socket = sock
+
+    def _recv_one(self) -> tuple[bytes, tuple[str, int]] | None:
+        assert self._socket is not None
+        try:
+            data, addr = self._socket.recvfrom(PACKET_BYTES * 2)
+            return data, addr
+        except socket.timeout:
+            return None
+        except OSError:
+            return None
+
+    async def _loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        while not self._stopped:
+            item = await loop.run_in_executor(None, self._recv_one)
+            if item is None or self._stopped:
+                continue
+            data, addr = item
+            if data == HEARTBEAT_PAYLOAD:
+                self._sources[addr[0]] = time.time()
+
+
+def _iface_index_map() -> dict[str, int]:
+    try:
+        return {name: idx for idx, name in socket.if_nameindex()}
+    except OSError:
+        return {}
+
+
+def _list_iface_ipv4() -> list[tuple[str, str, int]]:
+    """[(ifname, ipv4, ifindex), ...] 全球单播 IPv4 网卡。"""
+    index_by_name = _iface_index_map()
+    result: list[tuple[str, str, int]] = []
+    try:
+        out = subprocess.check_output(
+            ["ip", "-4", "-o", "addr", "show", "scope", "global"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 4 or "inet" not in parts:
+            continue
+        ifname = parts[1].rstrip(":")
+        inet_idx = parts.index("inet")
+        if inet_idx + 1 >= len(parts):
+            continue
+        ip = parts[inet_idx + 1].split("/", 1)[0]
+        if not ip or ip.startswith("127."):
+            continue
+        result.append((ifname, ip, index_by_name.get(ifname, 0)))
+    if result:
+        return result
+    for ifname, ifindex in ((n, i) for i, n in _iface_index_map().items()):
+        if ifname.startswith("lo"):
+            continue
+        result.append((ifname, "0.0.0.0", ifindex))
+    return result
+
+
+class MulticastPcmSource:
+    """组播 → 16k PCM16 帧队列。用法：await start()；循环 await next_frame()；await stop()。"""
+
+    def __init__(
+        self,
+        group: str = MCAST_GROUP,
+        port: int = MCAST_PORT,
+        *,
+        packet_bytes: int = PACKET_BYTES,
+        audio_bytes: int = AUDIO_BYTES,
+        heartbeat_interval: float = 5.0,
+    ) -> None:
+        self.group = group
+        self.port = int(port)
+        self.packet_bytes = packet_bytes
+        self.audio_bytes = audio_bytes
+        self.heartbeat_interval = float(heartbeat_interval)
+        self._resampler = SpeexResampler(INPUT_RATE, OUTPUT_RATE, quality=5)
+        self._back_resampler = SpeexResampler(OUTPUT_RATE, INPUT_RATE, quality=5)
+        self._queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=QUEUE_MAX)
+        self._pending = bytearray()
+        self._socket: socket.socket | None = None
+        self._mreqs: list[bytes] = []
+        self._send_ifaces: list[str] = []
+        self._receive_task: asyncio.Task[None] | None = None
+        self._stopped = False
+        self._last_heartbeat = 0.0
+        self._heartbeat_sources: dict[str, float] = {}
+        self.packets_received = 0
+        self.packets_bad_size = 0
+        self.frames_emitted = 0
+        self.heartbeats_sent = 0
+        self.back_packets_sent = 0
+
+    # ---------- 生命周期 ----------
+
+    async def start(self) -> None:
+        self._stopped = False
+        await asyncio.to_thread(self._join_group_sync)
+        self._receive_task = asyncio.create_task(self._receive_loop())
+
+    async def stop(self) -> None:
+        self._stopped = True
+        if self._receive_task is not None and not self._receive_task.done():
+            self._receive_task.cancel()
+            try:
+                await self._receive_task
+            except asyncio.CancelledError:
+                pass
+        if self._socket is not None:
+            for mreq in self._mreqs:
+                try:
+                    self._socket.setsockopt(socket.IPPROTO_IP, socket.IP_DROP_MEMBERSHIP, mreq)
+                except OSError:
+                    pass
+            self._mreqs = []
+            self._socket.close()
+            self._socket = None
+        self._resampler.close()
+        try:
+            self._queue.put_nowait(None)
+        except asyncio.QueueFull:
+            pass
+
+    async def set_group(self, group: str, port: int) -> None:
+        """运行时切换组播地址：re-join，音频帧缓冲清空。"""
+        self.group = group
+        self.port = int(port)
+        self._pending.clear()
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        await asyncio.to_thread(self._join_group_sync)
+
+    async def next_frame(self) -> bytes | None:
+        """下一帧 16k PCM16（1024B）；None 表示源已停止。"""
+        return await self._queue.get()
+
+    def flush(self) -> None:
+        """丢弃积压帧（一轮指令处理完后调用，避免陈旧音频误触发）。"""
+        self._pending.clear()
+        while True:
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+    # ---------- 原路返回 TTS（16k wav → 48k 组播 PCM） ----------
+
+    def _parse_wav_pcm16(self, wav_bytes: bytes) -> np.ndarray:
+        """解析 wav，返回 16kHz int16 单声道 PCM。"""
+        with io.BytesIO(wav_bytes) as bio:
+            with wave.open(bio, "rb") as wf:
+                nchannels = wf.getnchannels()
+                sampwidth = wf.getsampwidth()
+                framerate = wf.getframerate()
+                nframes = wf.getnframes()
+                raw = wf.readframes(nframes)
+        if sampwidth == 1:
+            pcm = np.frombuffer(raw, dtype=np.uint8).astype(np.int16) - 128
+        elif sampwidth == 2:
+            pcm = np.frombuffer(raw, dtype="<i2").copy()
+        else:
+            raise ValueError(f"unsupported sampwidth {sampwidth}")
+        if nchannels > 1:
+            pcm = pcm.reshape(-1, nchannels).mean(axis=1).astype(np.int16)
+        if framerate != OUTPUT_RATE:
+            pcm = resample(pcm, framerate, OUTPUT_RATE).astype(np.int16)
+        return pcm
+
+    def _send_back_sync(self, wav_bytes: bytes) -> None:
+        """同步发送：把 TTS wav 按 1280B 包发回组播组（前 640B 音频 + 后 640B 零）。"""
+        if self._socket is None:
+            print("[mcast] send_back skipped: socket closed")
+            return
+        try:
+            pcm16 = self._parse_wav_pcm16(wav_bytes)
+        except Exception as e:
+            print(f"[mcast] send_back parse wav failed: {e}")
+            return
+        if pcm16.size == 0:
+            print("[mcast] send_back skipped: empty pcm")
+            return
+        # 16k -> 48k
+        f32 = pcm16.astype(np.float32) / 32768.0
+        out48 = self._back_resampler.process_float(f32)
+        pcm48 = (np.clip(out48, -1.0, 1.0) * 32767).astype("<i2")
+        # 与 multi-stream-asr / sm-sdk 输入协议一致：1280B 包，前 640B 音频 + 后 640B 零
+        audio_samples = AUDIO_BYTES // 2  # 320
+        packet_interval = audio_samples / INPUT_RATE
+        sent = 0
+        for i in range(0, len(pcm48), audio_samples):
+            audio_chunk = pcm48[i : i + audio_samples].tobytes()
+            if len(audio_chunk) < AUDIO_BYTES:
+                audio_chunk += bytes(AUDIO_BYTES - len(audio_chunk))
+            chunk = audio_chunk + bytes(PACKET_BYTES - AUDIO_BYTES)
+            try:
+                self._socket.sendto(chunk, (self.group, self.port))
+                sent += 1
+            except OSError as e:
+                print(f"[mcast] send_back packet failed: {e}")
+                break
+            if i + audio_samples < len(pcm48):
+                time.sleep(packet_interval)
+        self.back_packets_sent += sent
+        print(
+            f"[mcast] send_back {sent} packets ({len(pcm48) / INPUT_RATE:.2f}s) "
+            f"group={self.group}:{self.port} total_back={self.back_packets_sent}"
+        )
+
+    async def send_back(self, wav_bytes: bytes) -> None:
+        """异步发送 TTS 音频回原组播组。"""
+        await asyncio.to_thread(self._send_back_sync, wav_bytes)
+
+    def _send_to_sync(self, group: str, port: int, wav_bytes: bytes) -> None:
+        """同步发送 TTS 音频到指定组播地址（1280B 包，前 640B 音频 + 后 640B 零）。"""
+        if self._socket is None:
+            print("[mcast] send_to skipped: socket closed")
+            return
+        try:
+            pcm16 = self._parse_wav_pcm16(wav_bytes)
+        except Exception as e:
+            print(f"[mcast] send_to parse wav failed: {e}")
+            return
+        if pcm16.size == 0:
+            print("[mcast] send_to skipped: empty pcm")
+            return
+        f32 = pcm16.astype(np.float32) / 32768.0
+        out48 = self._back_resampler.process_float(f32)
+        pcm48 = (np.clip(out48, -1.0, 1.0) * 32767).astype("<i2")
+        # 与 multi-stream-asr / sm-sdk 输入协议一致：1280B 包，前 640B 音频 + 后 640B 零
+        audio_samples = AUDIO_BYTES // 2  # 320
+        packet_interval = audio_samples / INPUT_RATE
+        sent = 0
+        for i in range(0, len(pcm48), audio_samples):
+            audio_chunk = pcm48[i : i + audio_samples].tobytes()
+            if len(audio_chunk) < AUDIO_BYTES:
+                audio_chunk += bytes(AUDIO_BYTES - len(audio_chunk))
+            chunk = audio_chunk + bytes(PACKET_BYTES - AUDIO_BYTES)
+            try:
+                self._socket.sendto(chunk, (group, port))
+                sent += 1
+            except OSError as e:
+                print(f"[mcast] send_to packet failed: {e}")
+                break
+            if i + audio_samples < len(pcm48):
+                time.sleep(packet_interval)
+        self.back_packets_sent += sent
+        print(
+            f"[mcast] send_to {sent} packets ({len(pcm48) / INPUT_RATE:.2f}s) "
+            f"target={group}:{port} total_back={self.back_packets_sent}"
+        )
+
+    async def send_to(self, group: str, port: int, wav_bytes: bytes) -> None:
+        """异步发送 TTS 音频到指定组播地址。"""
+        await asyncio.to_thread(self._send_to_sync, group, port, wav_bytes)
+
+    # ---------- 组播加入（逐网卡，ip_mreqn 优先，与 multi-stream-asr 一致） ----------
+
+    def _join_group_sync(self) -> None:
+        if self._socket is not None:
+            for mreq in self._mreqs:
+                try:
+                    self._socket.setsockopt(socket.IPPROTO_IP, socket.IP_DROP_MEMBERSHIP, mreq)
+                except OSError:
+                    pass
+            self._mreqs = []
+            self._socket.close()
+            self._socket = None
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except (AttributeError, OSError):
+            pass
+        try:
+            sock.bind((self.group, self.port))
+        except OSError as exc:
+            print(f"[mcast] bind({self.group},{self.port}) 失败({exc})，回退 0.0.0.0")
+            sock.bind(("0.0.0.0", self.port))
+        if hasattr(socket, "IP_MULTICAST_ALL"):
+            try:
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_ALL, 1)
+            except OSError:
+                pass
+
+        joined: list[str] = []
+        send_ifaces: list[str] = []
+        last_err: OSError | None = None
+        for ifname, iface_ip, ifindex in _list_iface_ipv4():
+            candidates: list[bytes] = []
+            if ifindex > 0:
+                candidates.append(
+                    struct.pack("4s4si", socket.inet_aton(self.group),
+                                socket.inet_aton("0.0.0.0"), ifindex)
+                )
+            if iface_ip not in ("", "0.0.0.0"):
+                candidates.append(
+                    struct.pack("4s4s", socket.inet_aton(self.group),
+                                socket.inet_aton(iface_ip))
+                )
+            if not candidates:
+                candidates.append(
+                    struct.pack("4sl", socket.inet_aton(self.group), socket.INADDR_ANY)
+                )
+            for mreq in candidates:
+                try:
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+                    self._mreqs.append(mreq)
+                    joined.append(f"{ifname}/{iface_ip}/if{ifindex}")
+                    if iface_ip not in ("", "0.0.0.0"):
+                        send_ifaces.append(iface_ip)
+                    break
+                except OSError as exc:
+                    last_err = exc
+
+        if not self._mreqs:
+            sock.close()
+            raise RuntimeError(f"加入组播组 {self.group}:{self.port} 失败: {last_err}")
+
+        sock.settimeout(1.0)
+        self._socket = sock
+        self._send_ifaces = send_ifaces
+        if send_ifaces:
+            # 组播发包出口网卡缺省值；CMD_B 心跳会逐网卡轮发，TTS 走这里设的第一块
+            try:
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
+                                socket.inet_aton(send_ifaces[0]))
+            except OSError:
+                pass
+        print(f"[mcast] 已加入 {self.group}:{self.port} ({', '.join(joined)})")
+
+    # ---------- 收包 / 心跳 / 重采样 ----------
+
+    def _maybe_send_heartbeat(self) -> None:
+        if self.heartbeat_interval <= 0 or self._socket is None:
+            return
+        now = time.time()
+        if now - self._last_heartbeat < self.heartbeat_interval:
+            return
+        # 逐网卡轮发：多网卡时内核默认只从一块网卡出组播包，
+        # 设备换到其它网段（如改过 IP）后会收不到 CMD_B。
+        targets: list[str | None] = self._send_ifaces or [None]
+        sent = 0
+        for iface_ip in targets:
+            try:
+                if iface_ip is not None:
+                    self._socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
+                                            socket.inet_aton(iface_ip))
+                self._socket.sendto(HEARTBEAT_PAYLOAD, (self.group, self.port))
+                sent += 1
+            except OSError as exc:
+                print(f"[mcast] CMD_B 心跳发送失败 iface={iface_ip}: {exc}")
+        if self._send_ifaces:
+            # 恢复默认出口网卡，避免影响 send_back / send_to 的发包路径
+            try:
+                self._socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
+                                        socket.inet_aton(self._send_ifaces[0]))
+            except OSError:
+                pass
+        if sent:
+            self._last_heartbeat = now
+            self.heartbeats_sent += 1
+
+    def _recv_one(self) -> tuple[bytes, tuple[str, int]] | None:
+        assert self._socket is not None
+        try:
+            data, addr = self._socket.recvfrom(self.packet_bytes * 2)
+            return data, addr
+        except socket.timeout:
+            return None
+        except OSError:
+            if not self._stopped:
+                print("[mcast] recvfrom 异常", flush=True)
+            return None
+
+    def _record_heartbeat(self, addr: tuple[str, int]) -> None:
+        src_ip = addr[0]
+        now = time.time()
+        self._heartbeat_sources[src_ip] = now
+
+    def has_recent_heartbeat_from(self, ip: str) -> bool:
+        if not ip:
+            return True
+        last = self._heartbeat_sources.get(ip)
+        if last is not None and (time.time() - last) <= self.require_heartbeat_timeout:
+            return True
+        if self._tts_hb_monitor is not None and self._tts_hb_monitor.has_heartbeat_from(ip):
+            return True
+        return False
+
+    async def _receive_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        while not self._stopped:
+            if self._socket is None:
+                await asyncio.sleep(0.05)
+                continue
+            self._maybe_send_heartbeat()
+            item = await loop.run_in_executor(None, self._recv_one)
+            if item is None or self._stopped:
+                continue
+            data, addr = item
+            if len(data) != self.packet_bytes:
+                if data == HEARTBEAT_PAYLOAD:
+                    self._record_heartbeat(addr)
+                    continue  # 自己发的 CMD_B 心跳回环，正常
+                self.packets_bad_size += 1
+                if self.packets_bad_size in (1, 10, 100) or self.packets_bad_size % 500 == 0:
+                    print(f"[mcast] 包长异常 size={len(data)} 期望={self.packet_bytes} (累计{self.packets_bad_size})")
+                continue
+            self.packets_received += 1
+            if self.packets_received == 1 or self.packets_received % 1500 == 0:
+                print(f"[mcast] 收包={self.packets_received} 出帧={self.frames_emitted} 组={self.group}:{self.port}")
+
+            pcm16 = np.frombuffer(data[: self.audio_bytes], dtype="<i2")
+            f32 = pcm16.astype(np.float32) / 32768.0
+            out = self._resampler.process_float(f32)
+            self._pending.extend((np.clip(out, -1.0, 1.0) * 32767).astype("<i2").tobytes())
+            while len(self._pending) >= FRAME_BYTES:
+                frame = bytes(self._pending[:FRAME_BYTES])
+                del self._pending[:FRAME_BYTES]
+                self.frames_emitted += 1
+                try:
+                    self._queue.put_nowait(frame)
+                except asyncio.QueueFull:
+                    pass

@@ -1,0 +1,30 @@
+[Unit]
+Description=K3 MCP ASR LLM WebSocket (09_asr_llm_ws) - LLM-native routing
+After=network-online.target sound.target qwen3asr-server.service llama-server.service
+Wants=network-online.target qwen3asr-server.service llama-server.service
+
+[Service]
+Type=simple
+User=root123
+Group=root123
+WorkingDirectory=/opt/k3_mcp1
+Environment=PYTHONPATH=/opt/k3_mcp1
+Environment=KWS_MODEL_DIR=/var/lib/sm-sdk/models/kws/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01
+Environment=TTS_MODEL_DIR=/var/lib/sm-sdk/models/tts/matcha-icefall-zh-en
+Environment=TTS_BACKEND=matcha
+Environment=MCP_CONFIG=/opt/k3_mcp1/mcp.json
+Environment=PYTHONUNBUFFERED=1
+Environment=LLM_BACKEND=llama-server
+Environment=LLM_BASE_URL=http://127.0.0.1:8080
+Environment=LLM_REQUEST_TIMEOUT=300
+Environment=MCP_TOOL_LLM=Qwen3-30B-A3B-Instruct-2507-Q4_0.gguf
+Environment=MCP_TOOL_STYLE=native
+ExecStart=/opt/mcp_cilent/.venv/bin/python /opt/k3_mcp1/09_asr_llm_ws.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=k3_mcp
+
+[Install]
+WantedBy=multi-user.target

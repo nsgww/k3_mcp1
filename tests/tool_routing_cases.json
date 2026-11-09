@@ -1,0 +1,39 @@
+{
+  "tools": [
+    {"name": "btn_5_push", "description": "打开走廊灯", "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "btn_6_push", "description": "关闭走廊灯", "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "btn_7_push", "description": "打开会议室灯", "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "btn_8_push", "description": "关闭会议室灯", "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "btn_9_push", "description": "打开办公室灯", "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "btn_10_push", "description": "关闭办公室灯", "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "get_corridor_ligth_state", "description": "走廊灯状态", "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "get_Meetingroom_ligth_state", "description": "会议室灯状态", "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "get_office_ligth_state", "description": "办公室灯状态", "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "get_litgh_value", "description": "灯光亮度", "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "level_1", "description": "灯光亮度范围0到100%，调用时传 value", "inputSchema": {"type": "object", "properties": {"value": {"type": "number", "minimum": 0, "maximum": 100}}, "required": ["value"], "additionalProperties": false}}
+  ],
+  "cases": [
+    {"id": "corridor_open_synonym", "prompt": "走道那边太暗了，帮我把灯点亮", "expected_calls": [{"name": "btn_5_push", "arguments": {}}], "mock_results": {"btn_5_push": "ok"}},
+    {"id": "corridor_status_ellipsis", "prompt": "走廊那盏现在怎么样", "expected_calls": [{"name": "get_corridor_ligth_state", "arguments": {}}], "mock_results": {"get_corridor_ligth_state": "{\"value\":\"关\"}"}},
+    {"id": "meeting_close", "prompt": "会议结束了，把会议室灯关掉", "expected_calls": [{"name": "btn_8_push", "arguments": {}}], "mock_results": {"btn_8_push": "ok"}},
+    {"id": "office_open", "prompt": "办公室需要照明", "expected_calls": [{"name": "btn_9_push", "arguments": {}}], "mock_results": {"btn_9_push": "ok"}},
+    {"id": "brightness_parameter", "prompt": "把灯光亮度调到35%", "expected_calls": [{"name": "level_1", "arguments": {"value": 35}}], "mock_results": {"level_1": "ok"}},
+    {"id": "multi_status", "prompt": "分别看看走廊和办公室的灯是什么状态", "expected_calls": [{"name": "get_corridor_ligth_state", "arguments": {}}, {"name": "get_office_ligth_state", "arguments": {}}], "mock_results": {"get_corridor_ligth_state": "{\"value\":\"关\"}", "get_office_ligth_state": "{\"value\":\"开\"}"}},
+    {"id": "chitchat_no_call", "prompt": "给我讲个十个字以内的笑话", "expected_calls": []},
+    {"id": "negative_no_call", "prompt": "不要开办公室灯，我只是随口说说", "expected_calls": []},
+    {"id": "discussion_no_call", "prompt": "办公室灯和走廊灯有什么区别", "expected_calls": []},
+    {"id": "unsupported_balcony_open", "prompt": "打开阳台灯", "expected_calls": []},
+    {"id": "unsupported_balcony_close", "prompt": "关闭阳台灯", "expected_calls": []},
+    {
+      "id": "live_corridor_open",
+      "prompt": "请把走廊灯打开",
+      "expected_calls": [{"name": "btn_5_push", "arguments": {}}],
+      "mock_results": {"btn_5_push": "ok"},
+      "side_effect": {
+        "state_tool": "get_corridor_ligth_state",
+        "expected_state": "开",
+        "restore_by_state": {"开": "btn_5_push", "关": "btn_6_push"}
+      }
+    }
+  ]
+}
